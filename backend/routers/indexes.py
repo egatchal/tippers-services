@@ -32,10 +32,11 @@ async def create_index(
     - **partition_config**: Partition configuration
     """
     # Validate SQL syntax (basic validation)
-    if not request.sql_query.strip().upper().startswith("SELECT"):
+    query_upper = request.sql_query.strip().upper()
+    if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="SQL query must be a SELECT statement"
+            detail="SQL query must be a SELECT statement or CTE (WITH clause)"
         )
 
     # Check if name already exists for this concept
@@ -157,10 +158,11 @@ async def update_index(
 
     # Validate SQL if provided
     if "sql_query" in update_data:
-        if not update_data["sql_query"].strip().upper().startswith("SELECT"):
+        query_upper = update_data["sql_query"].strip().upper()
+        if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH")):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="SQL query must be a SELECT statement"
+                detail="SQL query must be a SELECT statement or CTE (WITH clause)"
             )
 
     # Check name uniqueness if updating name

@@ -3,11 +3,13 @@ from dagster import asset, AssetExecutionContext, Output, AssetIn
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import pandas as pd
+import numpy as np
 import os
 from datetime import datetime
 from typing import Dict, Any
 import json
 from cryptography.fernet import Fernet
+from jinja2 import Template
 
 
 def get_db_engine():
@@ -187,13 +189,17 @@ def materialized_rule(context: AssetExecutionContext, index_data: Dict[str, Any]
     session = Session()
 
     try:
-        # Get rule metadata
+        # Get rule metadata including index_id
         context.log.info(f"Loading rule metadata for rule_id={rule_id}")
 
         result = session.execute(
             text("""
-            SELECT * FROM concept_rules
-            WHERE r_id = :rule_id
+            SELECT cr.*, ci.conn_id, ci.storage_path as index_storage_path,
+                   dc.host, dc.port, dc.database, dc.user, dc.encrypted_password, dc.connection_type
+            FROM concept_rules cr
+            JOIN concept_indexes ci ON cr.index_id = ci.index_id
+            JOIN database_connections dc ON ci.conn_id = dc.conn_id
+            WHERE cr.r_id = :rule_id
             """),
             {"rule_id": rule_id}
         )
@@ -203,30 +209,70 @@ def materialized_rule(context: AssetExecutionContext, index_data: Dict[str, Any]
         if not rule_row:
             raise ValueError(f"Rule with ID {rule_id} not found")
 
-        # Load index data
-        index_storage_path = index_data["storage_path"]
+        # Load index data from S3 or local path
+        index_storage_path = rule_row.index_storage_path
         context.log.info(f"Loading index data from {index_storage_path}")
 
-        df_index = pd.read_parquet(index_storage_path)
+        # Download from S3 if needed
+        if index_storage_path.startswith("s3://"):
+            # Parse S3 path
+            s3_path_parts = index_storage_path.replace("s3://", "").split("/", 1)
+            s3_bucket = s3_path_parts[0]
+            s3_key = s3_path_parts[1]
+
+            # Download to temp file
+            local_index_path = f"/tmp/index_{rule_row.index_id}.parquet"
+            s3_client = context.resources.s3_storage.get_client()
+            s3_client.download_file(s3_bucket, s3_key, local_index_path)
+            df_index = pd.read_parquet(local_index_path)
+        else:
+            df_index = pd.read_parquet(index_storage_path)
 
         context.log.info(f"Loaded {len(df_index)} rows from index")
 
-        # Execute rule SQL on index data
-        # For simplicity, we'll use pandas if the query is simple
-        # In production, you might want to use DuckDB or similar
-        sql_query = rule_row.sql_query
+        # Extract values from index_column for filtering
+        index_column = rule_row.index_column or df_index.columns[0]  # Default to first column
+        context.log.info(f"Extracting values from column: {index_column}")
 
-        context.log.info(f"Executing rule query: {sql_query[:100]}...")
+        if index_column not in df_index.columns:
+            raise ValueError(f"Column '{index_column}' not found in index data. Available columns: {list(df_index.columns)}")
 
-        # Create temporary table in DuckDB or similar
-        # For now, we'll use a simple pandas approach
-        # TODO: Implement proper SQL execution on dataframe
+        index_values = df_index[index_column].unique().tolist()
+        context.log.info(f"Extracted {len(index_values)} unique values from {index_column}")
 
-        # Placeholder: just return the index data with some computed columns
-        # In production, execute the actual SQL query
-        df_features = df_index  # This should be the result of executing sql_query on df_index
+        # Format values for SQL IN clause
+        # Handle both string and numeric values
+        def format_sql_value(val):
+            if isinstance(val, str):
+                # Escape single quotes in strings
+                escaped = val.replace("'", "''")
+                return f"'{escaped}'"
+            else:
+                return str(val)
 
-        context.log.info(f"Computed features: {len(df_features)} rows")
+        formatted_values = ", ".join([format_sql_value(v) for v in index_values])
+
+        # Replace :index_values placeholder with formatted values
+        rendered_sql = rule_row.sql_query.replace(":index_values", formatted_values)
+
+        # Also support additional template parameters if needed (backward compatibility)
+        if rule_row.query_template_params:
+            sql_template = Template(rendered_sql)
+            rendered_sql = sql_template.render(**rule_row.query_template_params)
+
+        context.log.info(f"Rendered SQL query (first 200 chars): {rendered_sql[:200]}...")
+        context.log.info(f"Total query length: {len(rendered_sql)} characters")
+
+        # Connect to external database and execute query
+        password = decrypt_password(rule_row.encrypted_password)
+        external_conn_str = f"{rule_row.connection_type}://{rule_row.user}:{password}@{rule_row.host}:{rule_row.port}/{rule_row.database}"
+
+        context.log.info(f"Connecting to external database: {rule_row.host}:{rule_row.port}/{rule_row.database}")
+
+        external_engine = create_engine(external_conn_str)
+        df_features = pd.read_sql(rendered_sql, external_engine)
+
+        context.log.info(f"Computed features: {len(df_features)} rows, {len(df_features.columns)} columns")
 
         # Store results locally
         local_storage_path = get_storage_path("rule", rule_id)
@@ -290,6 +336,155 @@ def materialized_rule(context: AssetExecutionContext, index_data: Dict[str, Any]
         raise
     finally:
         session.close()
+
+
+def apply_custom_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
+    """
+    Execute custom Python labeling function.
+
+    Safely executes user-provided code against feature DataFrame.
+    """
+    import numpy as np
+
+    code = lf_config.get("code", "")
+    allowed_imports = lf_config.get("allowed_imports", [])
+
+    # Build safe execution environment
+    safe_globals = {
+        "__builtins__": {
+            "abs": abs, "min": min, "max": max, "len": len,
+            "int": int, "float": float, "str": str, "bool": bool,
+            "sum": sum, "round": round, "range": range
+        },
+        "np": np,
+        "pd": pd
+    }
+
+    # Add allowed imports
+    for module_name in allowed_imports:
+        if module_name == "math":
+            import math
+            safe_globals["math"] = math
+        elif module_name == "re":
+            import re
+            safe_globals["re"] = re
+        elif module_name == "datetime":
+            from datetime import datetime
+            safe_globals["datetime"] = datetime
+        elif module_name == "statistics":
+            import statistics
+            safe_globals["statistics"] = statistics
+
+    # Compile the function
+    exec(code, safe_globals)
+
+    # Get the labeling function (should be named 'labeling_function')
+    labeling_function = safe_globals.get("labeling_function")
+
+    if not labeling_function:
+        raise ValueError("Custom code must define a function named 'labeling_function'")
+
+    # Apply to each row
+    labels = np.zeros(len(df), dtype=int)
+    for idx, row in df.iterrows():
+        try:
+            label = labeling_function(row)
+            # Ensure label is -1, 0, or 1
+            if label not in [-1, 0, 1]:
+                labels[idx] = -1  # Abstain on invalid output
+            else:
+                labels[idx] = label
+        except Exception as e:
+            context.log.warning(f"Error applying LF to row {idx}: {e}")
+            labels[idx] = -1  # Abstain on error
+
+    return labels
+
+
+def apply_threshold_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
+    """
+    Execute threshold-based labeling function.
+
+    Example config:
+    {
+        "feature": "visit_count",
+        "operator": ">",
+        "threshold": 50,
+        "label": 1
+    }
+    """
+    import numpy as np
+
+    feature = lf_config.get("feature")
+    operator = lf_config.get("operator")
+    threshold = lf_config.get("threshold")
+    label = lf_config.get("label", 1)
+
+    if feature not in df.columns:
+        context.log.error(f"Feature '{feature}' not found in DataFrame")
+        return np.full(len(df), -1, dtype=int)
+
+    labels = np.full(len(df), -1, dtype=int)  # Start with all abstain
+
+    # Apply threshold
+    if operator == ">":
+        mask = df[feature] > threshold
+    elif operator == ">=":
+        mask = df[feature] >= threshold
+    elif operator == "<":
+        mask = df[feature] < threshold
+    elif operator == "<=":
+        mask = df[feature] <= threshold
+    elif operator == "==":
+        mask = df[feature] == threshold
+    elif operator == "!=":
+        mask = df[feature] != threshold
+    else:
+        context.log.error(f"Unknown operator '{operator}'")
+        return labels
+
+    labels[mask] = label
+
+    return labels
+
+
+def apply_keyword_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
+    """
+    Execute keyword/regex-based labeling function.
+
+    Example config:
+    {
+        "field": "description",
+        "pattern": "high|premium|vip",
+        "label": 1
+    }
+    """
+    import numpy as np
+    import re
+
+    field = lf_config.get("field")
+    pattern = lf_config.get("pattern")
+    label = lf_config.get("label", 1)
+
+    if field not in df.columns:
+        context.log.error(f"Field '{field}' not found in DataFrame")
+        return np.full(len(df), -1, dtype=int)
+
+    labels = np.full(len(df), -1, dtype=int)
+
+    # Compile regex pattern
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except Exception as e:
+        context.log.error(f"Invalid regex pattern: {e}")
+        return labels
+
+    # Apply pattern matching
+    for idx, value in df[field].items():
+        if pd.notna(value) and regex.search(str(value)):
+            labels[idx] = label
+
+    return labels
 
 
 @asset(
@@ -373,12 +568,23 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
         L = np.zeros((n_samples, n_lfs), dtype=int)  # Label matrix
 
         for i, lf in enumerate(lfs):
-            context.log.info(f"Applying LF {i+1}/{n_lfs}: {lf.name}")
+            context.log.info(f"Applying LF {i+1}/{n_lfs}: {lf.name} (type: {lf.lf_type})")
 
-            # TODO: Implement actual LF execution based on lf_type and lf_config
-            # For now, randomly assign labels as placeholder
-            # In production, execute the actual LF logic
-            L[:, i] = np.random.choice([-1, 0, 1], size=n_samples)  # -1=abstain, 0/1=labels
+            try:
+                # Execute LF based on type
+                if lf.lf_type == "custom":
+                    L[:, i] = apply_custom_lf(df_features, lf.lf_config, context)
+                elif lf.lf_type == "threshold":
+                    L[:, i] = apply_threshold_lf(df_features, lf.lf_config, context)
+                elif lf.lf_type == "keyword":
+                    L[:, i] = apply_keyword_lf(df_features, lf.lf_config, context)
+                else:
+                    context.log.warning(f"Unknown LF type '{lf.lf_type}', abstaining on all samples")
+                    L[:, i] = -1  # Abstain
+
+            except Exception as e:
+                context.log.error(f"Error applying LF {lf.name}: {str(e)}")
+                L[:, i] = -1  # Abstain on error
 
         context.log.info("Label matrix created")
 

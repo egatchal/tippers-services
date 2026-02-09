@@ -163,9 +163,10 @@ class IndexMaterializeResponse(BaseModel):
 class RuleCreate(BaseModel):
     """Schema for creating a rule."""
     name: str = Field(..., description="Rule name")
-    conn_id: int = Field(..., description="Database connection ID")
-    sql_query: str = Field(..., description="SQL query to execute")
-    query_template_params: Optional[Dict[str, Any]] = Field(None, description="Jinja2 template parameters")
+    index_id: int = Field(..., description="Index ID to use as sample set")
+    sql_query: str = Field(..., description="SQL query with :index_values placeholder (e.g., WHERE user_id IN (:index_values))")
+    index_column: Optional[str] = Field(None, description="Column from index to extract for filtering (e.g., 'user_id'). Defaults to first column if not specified.")
+    query_template_params: Optional[Dict[str, Any]] = Field(None, description="Optional additional Jinja2 template parameters")
     applicable_cv_ids: Optional[List[int]] = Field(None, description="Concept value IDs this rule can identify")
     label_guidance: Optional[Dict[str, Any]] = Field(None, description="Guidance for creating LFs per label")
     partition_type: Optional[str] = Field(None, description="Partition type: time, id_range, categorical")
@@ -175,8 +176,9 @@ class RuleCreate(BaseModel):
 class RuleUpdate(BaseModel):
     """Schema for updating a rule."""
     name: Optional[str] = None
-    conn_id: Optional[int] = None
+    index_id: Optional[int] = None
     sql_query: Optional[str] = None
+    index_column: Optional[str] = None
     query_template_params: Optional[Dict[str, Any]] = None
     applicable_cv_ids: Optional[List[int]] = None
     label_guidance: Optional[Dict[str, Any]] = None
@@ -188,9 +190,10 @@ class RuleResponse(BaseModel):
     """Schema for rule response."""
     r_id: int
     c_id: int
-    conn_id: Optional[int]
+    index_id: int
     name: str
     sql_query: str
+    index_column: Optional[str]
     query_template_params: Optional[Dict[str, Any]]
     applicable_cv_ids: Optional[List[int]]
     label_guidance: Optional[Dict[str, Any]]

@@ -68,10 +68,11 @@ class ConceptRule(Base):
 
     r_id = Column(Integer, primary_key=True, autoincrement=True)
     c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
-    conn_id = Column(Integer, ForeignKey('database_connections.conn_id'), nullable=True)
+    index_id = Column(Integer, ForeignKey('concept_indexes.index_id'), nullable=False)
     name = Column(String(255), nullable=False)
     sql_query = Column(Text, nullable=False)
     query_template_params = Column(JSON, nullable=True)
+    index_column = Column(String(255), nullable=True)  # Column from index to use for filtering (e.g., 'user_id')
 
     # Label metadata - which concept values this rule's features can identify
     applicable_cv_ids = Column(ARRAY(Integer), nullable=True)

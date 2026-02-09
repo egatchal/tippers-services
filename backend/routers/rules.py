@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
 from backend.db.session import get_db
-from backend.db.models import ConceptRule, DatabaseConnection
+from backend.db.models import ConceptRule, ConceptIndex
 from backend.schemas import (
     RuleCreate,
     RuleUpdate,
@@ -25,17 +25,19 @@ async def create_rule(
 
     - **c_id**: Concept ID
     - **name**: Rule name (must be unique within concept)
-    - **conn_id**: Database connection ID
-    - **sql_query**: SQL query to execute (supports Jinja2 templates)
-    - **query_template_params**: Optional template parameters
+    - **index_id**: Index ID to use as sample set
+    - **sql_query**: SQL query with :index_values placeholder (e.g., WHERE user_id IN (:index_values))
+    - **index_column**: Column from index to extract for filtering (e.g., 'user_id')
+    - **query_template_params**: Optional additional template parameters
     - **partition_type**: Optional partitioning (time, id_range, categorical)
     - **partition_config**: Partition configuration
     """
     # Validate SQL syntax (basic validation)
-    if not request.sql_query.strip().upper().startswith("SELECT"):
+    query_upper = request.sql_query.strip().upper()
+    if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="SQL query must be a SELECT statement"
+            detail="SQL query must be a SELECT statement or CTE (WITH clause)"
         )
 
     # Check if name already exists for this concept
@@ -50,23 +52,37 @@ async def create_rule(
             detail=f"Rule with name '{request.name}' already exists for concept {c_id}"
         )
 
-    # Verify database connection exists
-    connection = db.query(DatabaseConnection).filter(
-        DatabaseConnection.conn_id == request.conn_id
+    # Verify index exists and belongs to this concept
+    index = db.query(ConceptIndex).filter(
+        ConceptIndex.index_id == request.index_id
     ).first()
 
-    if not connection:
+    if not index:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Database connection with ID {request.conn_id} not found"
+            detail=f"Index with ID {request.index_id} not found"
+        )
+
+    if index.c_id != c_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Index {request.index_id} does not belong to concept {c_id}"
+        )
+
+    # Verify index is materialized
+    if not index.is_materialized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Index {request.index_id} must be materialized before creating rules"
         )
 
     # Create rule
     rule = ConceptRule(
         c_id=c_id,
         name=request.name,
-        conn_id=request.conn_id,
+        index_id=request.index_id,
         sql_query=request.sql_query,
+        index_column=request.index_column,
         query_template_params=request.query_template_params,
         applicable_cv_ids=request.applicable_cv_ids,
         label_guidance=request.label_guidance,
@@ -159,10 +175,11 @@ async def update_rule(
 
     # Validate SQL if provided
     if "sql_query" in update_data:
-        if not update_data["sql_query"].strip().upper().startswith("SELECT"):
+        query_upper = update_data["sql_query"].strip().upper()
+        if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH")):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="SQL query must be a SELECT statement"
+                detail="SQL query must be a SELECT statement or CTE (WITH clause)"
             )
 
     # Check name uniqueness if updating name
@@ -179,16 +196,22 @@ async def update_rule(
                 detail=f"Rule with name '{update_data['name']}' already exists for concept {c_id}"
             )
 
-    # Verify connection exists if updating conn_id
-    if "conn_id" in update_data:
-        connection = db.query(DatabaseConnection).filter(
-            DatabaseConnection.conn_id == update_data["conn_id"]
+    # Verify index exists if updating index_id
+    if "index_id" in update_data:
+        index = db.query(ConceptIndex).filter(
+            ConceptIndex.index_id == update_data["index_id"]
         ).first()
 
-        if not connection:
+        if not index:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Database connection with ID {update_data['conn_id']} not found"
+                detail=f"Index with ID {update_data['index_id']} not found"
+            )
+
+        if index.c_id != c_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Index {update_data['index_id']} does not belong to concept {c_id}"
             )
 
     # Update fields
@@ -265,58 +288,51 @@ async def materialize_rule(
             detail=f"Rule with ID {r_id} not found for concept {c_id}"
         )
 
-    # Get database connection
-    connection = db.query(DatabaseConnection).filter(
-        DatabaseConnection.conn_id == rule.conn_id
+    # Verify index is materialized
+    index = db.query(ConceptIndex).filter(
+        ConceptIndex.index_id == rule.index_id
     ).first()
 
-    if not connection:
+    if not index:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Database connection with ID {rule.conn_id} not found"
+            detail=f"Index with ID {rule.index_id} not found"
         )
 
-    # TODO: Implement Dagster client integration
-    # from backend.utils.dagster_client import get_dagster_client, decrypt_password
-    #
-    # run_config = {
-    #     "resources": {
-    #         "database_connection": {
-    #             "config": {
-    #                 "host": connection.host,
-    #                 "port": connection.port,
-    #                 "database": connection.database,
-    #                 "user": connection.user,
-    #                 "password": decrypt_password(connection.encrypted_password),
-    #             }
-    #         }
-    #     },
-    #     "ops": {
-    #         "materialized_rule": {
-    #             "config": {
-    #                 "r_id": r_id,
-    #                 "sql_query": rule.sql_query,
-    #                 "query_template_params": rule.query_template_params or {},
-    #             }
-    #         }
-    #     }
-    # }
-    #
-    # dagster_client = get_dagster_client()
-    # result = dagster_client.submit_job_execution(
-    #     job_name="materialize_rule",
-    #     run_config=run_config
-    # )
-    #
-    # return RuleMaterializeResponse(
-    #     r_id=r_id,
-    #     dagster_run_id=result.run_id,
-    #     status="STARTED"
-    # )
+    if not index.is_materialized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Index {rule.index_id} must be materialized before materializing rules"
+        )
 
-    # Placeholder response
-    return RuleMaterializeResponse(
-        r_id=r_id,
-        dagster_run_id="placeholder-run-id",
-        status="STARTED"
-    )
+    # Trigger Dagster job
+    from backend.utils.dagster_client import get_dagster_client
+
+    try:
+        run_config = {
+            "ops": {
+                "materialized_rule": {
+                    "config": {
+                        "rule_id": r_id
+                    }
+                }
+            }
+        }
+
+        dagster_client = get_dagster_client()
+        result = dagster_client.submit_job_execution(
+            job_name="materialize_rule_job",
+            run_config=run_config
+        )
+
+        return RuleMaterializeResponse(
+            r_id=r_id,
+            dagster_run_id=result["run_id"],
+            status=result["status"]
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to trigger Dagster job: {str(e)}"
+        )
