@@ -1,0 +1,5 @@
+load_from:
+  - python_module:
+      module_name: backend.dagster_app.definitions
+      working_directory: /app
+      attribute: defs

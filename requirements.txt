@@ -1,0 +1,45 @@
+# FastAPI and web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+
+# Database
+sqlalchemy>=2.0.36
+psycopg2-binary>=2.9.10
+alembic>=1.14.0
+
+# Dagster - Note: Some versions may not support Python 3.13 yet
+dagster>=1.9.0
+dagster-webserver>=1.9.0
+dagster-postgres>=0.25.0
+dagster-aws>=0.25.0
+
+# Data processing - Using versions with Python 3.13 support
+pandas>=2.2.3
+numpy>=2.1.0
+pyarrow>=18.1.0
+
+# Snorkel - May need Python 3.11/3.12
+snorkel>=0.9.9
+
+# ML and tracking
+mlflow>=2.18.0
+scikit-learn>=1.6.0
+
+# AWS
+boto3>=1.35.0
+botocore>=1.35.0
+
+# Caching and queuing
+redis>=5.2.0
+
+# Utilities
+jinja2>=3.1.4
+python-dotenv>=1.0.1
+cryptography>=44.0.0
+
+# HTTP client
+httpx>=0.28.0
+requests>=2.32.0

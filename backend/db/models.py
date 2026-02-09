@@ -1,0 +1,163 @@
+from sqlalchemy import Column, Integer, String, Boolean, Text, TIMESTAMP, ARRAY, JSON, Float, ForeignKey
+from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
+from backend.db.session import Base
+
+
+class Concept(Base):
+    """Concepts table - the top-level entity for weak supervision."""
+    __tablename__ = "concepts"
+
+    c_id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class ConceptValue(Base):
+    """Concept values table - represents the labels/classes for a concept."""
+    __tablename__ = "concept_values"
+
+    cv_id = Column(Integer, primary_key=True, autoincrement=True)
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    display_order = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+
+class DatabaseConnection(Base):
+    """Database connections table."""
+    __tablename__ = "database_connections"
+
+    conn_id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, unique=True)
+    connection_type = Column(String(50), nullable=False)
+    host = Column(String(255), nullable=False)
+    port = Column(Integer, nullable=False)
+    database = Column(String(255), nullable=False)
+    user = Column(String(255), nullable=False)
+    encrypted_password = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+
+class ConceptIndex(Base):
+    """Concept indexes table - raw data source for Snorkel."""
+    __tablename__ = "concept_indexes"
+
+    index_id = Column(Integer, primary_key=True, autoincrement=True)
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    conn_id = Column(Integer, ForeignKey('database_connections.conn_id'), nullable=True)
+    name = Column(String(255), nullable=False)
+    sql_query = Column(Text, nullable=False)
+    query_template_params = Column(JSON, nullable=True)
+    partition_type = Column(String(50), nullable=True)
+    partition_config = Column(JSON, nullable=True)
+    storage_path = Column(String(500), nullable=True)
+    is_materialized = Column(Boolean, default=False)
+    materialized_at = Column(TIMESTAMP, nullable=True)
+    row_count = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class ConceptRule(Base):
+    """Concept rules/features table - computes features that labeling functions use."""
+    __tablename__ = "concept_rules"
+
+    r_id = Column(Integer, primary_key=True, autoincrement=True)
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    conn_id = Column(Integer, ForeignKey('database_connections.conn_id'), nullable=True)
+    name = Column(String(255), nullable=False)
+    sql_query = Column(Text, nullable=False)
+    query_template_params = Column(JSON, nullable=True)
+
+    # Label metadata - which concept values this rule's features can identify
+    applicable_cv_ids = Column(ARRAY(Integer), nullable=True)
+    label_guidance = Column(JSON, nullable=True)
+    # Example: {
+    #   "10": {"description": "HIGH_VALUE customers", "suggestion": "total_spent > 1000"},
+    #   "11": {"description": "MEDIUM_VALUE customers", "suggestion": "total_spent BETWEEN 500 AND 1000"}
+    # }
+
+    partition_type = Column(String(50), nullable=True)
+    partition_config = Column(JSON, nullable=True)
+    storage_path = Column(String(500), nullable=True)
+    is_materialized = Column(Boolean, default=False)
+    materialized_at = Column(TIMESTAMP, nullable=True)
+    row_count = Column(Integer, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class LabelingFunction(Base):
+    """Labeling functions table - voting logic that uses rule features (versioned)."""
+    __tablename__ = "labeling_functions"
+
+    lf_id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Core references
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    cv_id = Column(Integer, ForeignKey('concept_values.cv_id'), nullable=False)
+    rule_id = Column(Integer, ForeignKey('concept_rules.r_id'), nullable=False)
+
+    name = Column(String(255), nullable=False)
+
+    # Versioning support
+    version = Column(Integer, default=1, nullable=False)
+    parent_lf_id = Column(Integer, ForeignKey('labeling_functions.lf_id'), nullable=True)
+
+    # LF configuration
+    lf_type = Column(String(50), nullable=False)
+    lf_config = Column(JSON, nullable=False)
+    # Example: {
+    #   "feature_conditions": {
+    #     "total_spent": "> 1000",
+    #     "purchase_count": "> 5"
+    #   }
+    # }
+
+    # Status and lifecycle
+    is_active = Column(Boolean, default=True)
+    requires_approval = Column(Boolean, default=False)
+    deprecated_at = Column(TIMESTAMP, nullable=True)
+    deprecated_by_lf_id = Column(Integer, ForeignKey('labeling_functions.lf_id'), nullable=True)
+
+    # Performance metrics (populated after Snorkel evaluation)
+    estimated_accuracy = Column(Float, nullable=True)
+    coverage = Column(Float, nullable=True)
+    conflicts = Column(Integer, nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class SnorkelJob(Base):
+    """Snorkel training jobs table - orchestrates the weak supervision pipeline."""
+    __tablename__ = "snorkel_jobs"
+
+    job_id = Column(Integer, primary_key=True, autoincrement=True)
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    index_id = Column(Integer, ForeignKey('concept_indexes.index_id'), nullable=False)
+
+    # References to rules (for feature computation) and LFs (for voting)
+    rule_ids = Column(ARRAY(Integer), nullable=True)
+    lf_ids = Column(ARRAY(Integer), nullable=True)
+
+    # Snorkel configuration
+    config = Column(JSON, nullable=True)
+    # Example: {
+    #   "learning_rate": 0.01,
+    #   "epochs": 100,
+    #   "class_balance": [0.3, 0.4, 0.3]
+    # }
+
+    output_type = Column(String(50), default='hard_labels')
+    dagster_run_id = Column(String(255), nullable=True)
+    status = Column(String(50), default='PENDING')
+    result_path = Column(String(500), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    completed_at = Column(TIMESTAMP, nullable=True)

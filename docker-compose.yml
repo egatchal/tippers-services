@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: tippers-postgres
+    environment:
+      POSTGRES_DB: tippers
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tippers-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tippers-fastapi
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/tippers
+      - REDIS_URL=redis://redis:6379
+      - DAGSTER_HOST=dagster-webserver
+      - DAGSTER_PORT=3000
+      - ENCRYPTION_KEY=sqKEsHs77url0z08dERPLf5rg9f04GG-azUnvF8iFBA=
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - PYTHONPATH=/app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tippers-dagster-daemon
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/tippers
+      - REDIS_URL=redis://redis:6379
+      - ENCRYPTION_KEY=sqKEsHs77url0z08dERPLf5rg9f04GG-azUnvF8iFBA=
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - PYTHONPATH=/app
+      - DAGSTER_HOME=/app/dagster_home
+    volumes:
+      - ./backend:/app/backend
+      - dagster_home:/app/dagster_home
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: dagster-daemon run -w /app/backend/dagster_app/workspace.yaml
+
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tippers-dagster-webserver
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/tippers
+      - REDIS_URL=redis://redis:6379
+      - ENCRYPTION_KEY=sqKEsHs77url0z08dERPLf5rg9f04GG-azUnvF8iFBA=
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - PYTHONPATH=/app
+      - DAGSTER_HOME=/app/dagster_home
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app/backend
+      - dagster_home:/app/dagster_home
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: dagster-webserver -h 0.0.0.0 -p 3000 -w /app/backend/dagster_app/workspace.yaml
+
+volumes:
+  postgres_data:
+  redis_data:
+  dagster_home:
