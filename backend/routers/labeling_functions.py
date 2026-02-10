@@ -1,20 +1,16 @@
 """Labeling function CRUD endpoints with versioning support."""
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from typing import List
 from backend.db.session import get_db
 from backend.db.models import LabelingFunction, ConceptRule, ConceptValue
 from backend.schemas import (
     LabelingFunctionCreate,
-    TemplateLFCreate,
-    RegexLFCreate,
-    CustomLFCreate,
     LabelingFunctionUpdate,
     LabelingFunctionResponse,
     LabelingFunctionVersionCreate
 )
 from datetime import datetime
-import re
 
 router = APIRouter()
 
@@ -49,6 +45,34 @@ def validate_custom_python(code: str, allowed_imports: List[str]):
             )
 
 
+def generate_lf_template(concept_values: list) -> str:
+    """
+    Auto-generate a labeling function template from concept values.
+
+    Args:
+        concept_values: list of (cv_id, name) tuples
+    """
+    lines = []
+
+    # Generate constants for each concept value
+    for cv_id, name in concept_values:
+        lines.append(f"{name.upper()} = {cv_id}")
+    lines.append("ABSTAIN = -1")
+    lines.append("")
+    lines.append("def labeling_function(row):")
+    lines.append("    # TODO: implement voting logic")
+    lines.append("    # Available columns: row['column_name']")
+
+    # Add example condition for the first concept value
+    if concept_values:
+        first_cv_id, first_name = concept_values[0]
+        lines.append(f"    # Example: return {first_name.upper()} if condition met")
+
+    lines.append("    return ABSTAIN")
+
+    return "\n".join(lines)
+
+
 @router.post("/{c_id}/labeling-functions", response_model=LabelingFunctionResponse, status_code=status.HTTP_201_CREATED)
 async def create_labeling_function(
     c_id: int,
@@ -56,14 +80,14 @@ async def create_labeling_function(
     db: Session = Depends(get_db)
 ):
     """
-    Create a new labeling function with rule coupling.
+    Create a new custom labeling function.
 
     - **c_id**: Concept ID
     - **name**: LF name
     - **rule_id**: Rule ID that provides features (REQUIRED)
-    - **cv_id**: Concept value ID (label to vote for)
-    - **lf_type**: LF type (threshold, keyword, sql, custom)
-    - **lf_config**: LF configuration
+    - **applicable_cv_ids**: Concept value IDs this LF can vote on
+    - **code**: Python code (if omitted, a template is auto-generated)
+    - **allowed_imports**: List of allowed import modules
     - **parent_lf_id**: Optional parent LF ID for versioning
     """
     # Verify rule exists and belongs to concept
@@ -78,16 +102,19 @@ async def create_labeling_function(
             detail=f"Rule with ID {request.rule_id} not found for concept {c_id}"
         )
 
-    # Verify concept value exists and belongs to concept
-    concept_value = db.query(ConceptValue).filter(
+    # Validate applicable_cv_ids — batch lookup
+    concept_values = db.query(ConceptValue).filter(
         ConceptValue.c_id == c_id,
-        ConceptValue.cv_id == request.cv_id
-    ).first()
+        ConceptValue.cv_id.in_(request.applicable_cv_ids)
+    ).all()
 
-    if not concept_value:
+    found_cv_ids = {cv.cv_id for cv in concept_values}
+    missing_cv_ids = set(request.applicable_cv_ids) - found_cv_ids
+
+    if missing_cv_ids:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Concept value with ID {request.cv_id} not found for concept {c_id}"
+            detail=f"Concept value IDs {sorted(missing_cv_ids)} not found for concept {c_id}"
         )
 
     # Check if name already exists
@@ -117,281 +144,28 @@ async def create_labeling_function(
 
         version = parent.version + 1
 
+    # Build code — use provided or auto-generate template
+    code = request.code
+    if not code:
+        cv_tuples = [(cv.cv_id, cv.name) for cv in concept_values]
+        code = generate_lf_template(cv_tuples)
+    else:
+        validate_custom_python(code, request.allowed_imports)
+
     # Create LF
     lf = LabelingFunction(
         c_id=c_id,
-        cv_id=request.cv_id,
+        applicable_cv_ids=request.applicable_cv_ids,
         rule_id=request.rule_id,
         name=request.name,
         version=version,
         parent_lf_id=request.parent_lf_id,
-        lf_type=request.lf_type,
-        lf_config=request.lf_config,
-        is_active=True,
-        requires_approval=request.lf_type == "custom"
-    )
-
-    db.add(lf)
-    db.commit()
-    db.refresh(lf)
-
-    return lf
-
-
-@router.post("/{c_id}/labeling-functions/template", response_model=LabelingFunctionResponse, status_code=status.HTTP_201_CREATED)
-async def create_template_lf(
-    c_id: int,
-    request: TemplateLFCreate,
-    db: Session = Depends(get_db)
-):
-    """
-    Create a template-based labeling function.
-
-    Template LFs are simple condition-based rules like:
-    - field > value
-    - field == value
-    - field contains value
-
-    - **c_id**: Concept ID
-    - **name**: LF name
-    - **rule_id**: Rule ID that provides features
-    - **cv_id**: Concept value ID (label)
-    - **template**: Template type
-    - **field**: Field to evaluate
-    - **operator**: Comparison operator (>, <, ==, !=, >=, <=)
-    - **value**: Value to compare against
-    - **label**: Label to apply if condition is met
-    """
-    # Validate operator
-    valid_operators = [">", "<", "==", "!=", ">=", "<=", "contains", "startswith", "endswith"]
-    if request.operator not in valid_operators:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid operator. Must be one of: {', '.join(valid_operators)}"
-        )
-
-    # Verify rule exists
-    rule = db.query(ConceptRule).filter(
-        ConceptRule.c_id == c_id,
-        ConceptRule.r_id == request.rule_id
-    ).first()
-
-    if not rule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Rule with ID {request.rule_id} not found for concept {c_id}"
-        )
-
-    # Verify concept value exists
-    concept_value = db.query(ConceptValue).filter(
-        ConceptValue.c_id == c_id,
-        ConceptValue.cv_id == request.cv_id
-    ).first()
-
-    if not concept_value:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Concept value with ID {request.cv_id} not found for concept {c_id}"
-        )
-
-    # Check if name already exists
-    existing = db.query(LabelingFunction).filter(
-        LabelingFunction.c_id == c_id,
-        LabelingFunction.name == request.name
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Labeling function with name '{request.name}' already exists for concept {c_id}"
-        )
-
-    # Create LF
-    lf = LabelingFunction(
-        c_id=c_id,
-        cv_id=request.cv_id,
-        rule_id=request.rule_id,
-        name=request.name,
-        version=1,
-        lf_type="template",
-        lf_config={
-            "template": request.template,
-            "field": request.field,
-            "operator": request.operator,
-            "value": request.value,
-            "label": request.label
-        },
-        is_active=True,
-        requires_approval=False
-    )
-
-    db.add(lf)
-    db.commit()
-    db.refresh(lf)
-
-    return lf
-
-
-@router.post("/{c_id}/labeling-functions/regex", response_model=LabelingFunctionResponse, status_code=status.HTTP_201_CREATED)
-async def create_regex_lf(
-    c_id: int,
-    request: RegexLFCreate,
-    db: Session = Depends(get_db)
-):
-    """
-    Create a regex-based labeling function.
-
-    Regex LFs match text patterns using regular expressions.
-
-    - **c_id**: Concept ID
-    - **name**: LF name
-    - **rule_id**: Rule ID that provides features
-    - **cv_id**: Concept value ID (label)
-    - **pattern**: Regex pattern
-    - **field**: Field to match against
-    - **label**: Label to apply if pattern matches
-    """
-    # Validate regex pattern
-    try:
-        re.compile(request.pattern)
-    except re.error as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid regex pattern: {str(e)}"
-        )
-
-    # Verify rule exists
-    rule = db.query(ConceptRule).filter(
-        ConceptRule.c_id == c_id,
-        ConceptRule.r_id == request.rule_id
-    ).first()
-
-    if not rule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Rule with ID {request.rule_id} not found for concept {c_id}"
-        )
-
-    # Verify concept value exists
-    concept_value = db.query(ConceptValue).filter(
-        ConceptValue.c_id == c_id,
-        ConceptValue.cv_id == request.cv_id
-    ).first()
-
-    if not concept_value:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Concept value with ID {request.cv_id} not found for concept {c_id}"
-        )
-
-    # Check if name already exists
-    existing = db.query(LabelingFunction).filter(
-        LabelingFunction.c_id == c_id,
-        LabelingFunction.name == request.name
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Labeling function with name '{request.name}' already exists for concept {c_id}"
-        )
-
-    # Create LF
-    lf = LabelingFunction(
-        c_id=c_id,
-        cv_id=request.cv_id,
-        rule_id=request.rule_id,
-        name=request.name,
-        version=1,
-        lf_type="regex",
-        lf_config={
-            "pattern": request.pattern,
-            "field": request.field,
-            "label": request.label
-        },
-        is_active=True,
-        requires_approval=False
-    )
-
-    db.add(lf)
-    db.commit()
-    db.refresh(lf)
-
-    return lf
-
-
-@router.post("/{c_id}/labeling-functions/custom", response_model=LabelingFunctionResponse, status_code=status.HTTP_201_CREATED)
-async def create_custom_lf(
-    c_id: int,
-    request: CustomLFCreate,
-    db: Session = Depends(get_db)
-):
-    """
-    Create a custom Python labeling function.
-
-    Custom LFs require admin approval before activation.
-
-    - **c_id**: Concept ID
-    - **name**: LF name
-    - **rule_id**: Rule ID that provides features
-    - **cv_id**: Concept value ID (label)
-    - **code**: Python code for the labeling function
-    - **allowed_imports**: List of allowed import modules
-    - **label**: Label to apply
-    """
-    # Validate custom code
-    validate_custom_python(request.code, request.allowed_imports)
-
-    # Verify rule exists
-    rule = db.query(ConceptRule).filter(
-        ConceptRule.c_id == c_id,
-        ConceptRule.r_id == request.rule_id
-    ).first()
-
-    if not rule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Rule with ID {request.rule_id} not found for concept {c_id}"
-        )
-
-    # Verify concept value exists
-    concept_value = db.query(ConceptValue).filter(
-        ConceptValue.c_id == c_id,
-        ConceptValue.cv_id == request.cv_id
-    ).first()
-
-    if not concept_value:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Concept value with ID {request.cv_id} not found for concept {c_id}"
-        )
-
-    # Check if name already exists
-    existing = db.query(LabelingFunction).filter(
-        LabelingFunction.c_id == c_id,
-        LabelingFunction.name == request.name
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Labeling function with name '{request.name}' already exists for concept {c_id}"
-        )
-
-    # Create LF (inactive until approved)
-    lf = LabelingFunction(
-        c_id=c_id,
-        cv_id=request.cv_id,
-        rule_id=request.rule_id,
-        name=request.name,
-        version=1,
         lf_type="custom",
         lf_config={
-            "code": request.code,
-            "allowed_imports": request.allowed_imports,
-            "label": request.label
+            "code": code,
+            "allowed_imports": request.allowed_imports
         },
-        is_active=False,  # Requires approval
+        is_active=False,
         requires_approval=True
     )
 
@@ -400,6 +174,38 @@ async def create_custom_lf(
     db.refresh(lf)
 
     return lf
+
+
+@router.get("/{c_id}/labeling-functions/template")
+async def preview_lf_template(
+    c_id: int,
+    applicable_cv_ids: List[int] = Query(..., description="Concept value IDs to include in template"),
+    db: Session = Depends(get_db)
+):
+    """
+    Preview an auto-generated labeling function template without creating an LF.
+
+    - **c_id**: Concept ID
+    - **applicable_cv_ids**: Concept value IDs to include in template
+    """
+    concept_values = db.query(ConceptValue).filter(
+        ConceptValue.c_id == c_id,
+        ConceptValue.cv_id.in_(applicable_cv_ids)
+    ).all()
+
+    found_cv_ids = {cv.cv_id for cv in concept_values}
+    missing_cv_ids = set(applicable_cv_ids) - found_cv_ids
+
+    if missing_cv_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Concept value IDs {sorted(missing_cv_ids)} not found for concept {c_id}"
+        )
+
+    cv_tuples = [(cv.cv_id, cv.name) for cv in concept_values]
+    code = generate_lf_template(cv_tuples)
+
+    return {"code": code, "applicable_cv_ids": applicable_cv_ids}
 
 
 @router.post("/{c_id}/labeling-functions/{lf_id}/versions", response_model=LabelingFunctionResponse, status_code=status.HTTP_201_CREATED)
@@ -415,7 +221,7 @@ async def create_lf_version(
     This creates a new LF with:
     - Incremented version number
     - parent_lf_id pointing to the original
-    - Same rule_id and cv_id
+    - Same rule_id and applicable_cv_ids
     - New lf_config
 
     - **c_id**: Concept ID
@@ -445,15 +251,15 @@ async def create_lf_version(
 
     new_lf = LabelingFunction(
         c_id=c_id,
-        cv_id=parent_lf.cv_id,
+        applicable_cv_ids=parent_lf.applicable_cv_ids,
         rule_id=parent_lf.rule_id,
         name=new_name,
         version=parent_lf.version + 1,
         parent_lf_id=lf_id,
-        lf_type=parent_lf.lf_type,
+        lf_type="custom",
         lf_config=request.lf_config,
-        is_active=True,
-        requires_approval=parent_lf.lf_type == "custom"
+        is_active=False,
+        requires_approval=True
     )
 
     db.add(new_lf)

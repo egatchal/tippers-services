@@ -74,14 +74,6 @@ class ConceptRule(Base):
     query_template_params = Column(JSON, nullable=True)
     index_column = Column(String(255), nullable=True)  # Column from index to use for filtering (e.g., 'user_id')
 
-    # Label metadata - which concept values this rule's features can identify
-    applicable_cv_ids = Column(ARRAY(Integer), nullable=True)
-    label_guidance = Column(JSON, nullable=True)
-    # Example: {
-    #   "10": {"description": "HIGH_VALUE customers", "suggestion": "total_spent > 1000"},
-    #   "11": {"description": "MEDIUM_VALUE customers", "suggestion": "total_spent BETWEEN 500 AND 1000"}
-    # }
-
     partition_type = Column(String(50), nullable=True)
     partition_config = Column(JSON, nullable=True)
     storage_path = Column(String(500), nullable=True)
@@ -100,7 +92,7 @@ class LabelingFunction(Base):
 
     # Core references
     c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
-    cv_id = Column(Integer, ForeignKey('concept_values.cv_id'), nullable=False)
+    applicable_cv_ids = Column(ARRAY(Integer), nullable=False)
     rule_id = Column(Integer, ForeignKey('concept_rules.r_id'), nullable=False)
 
     name = Column(String(255), nullable=False)

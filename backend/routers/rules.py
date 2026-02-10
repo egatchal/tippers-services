@@ -84,8 +84,6 @@ async def create_rule(
         sql_query=request.sql_query,
         index_column=request.index_column,
         query_template_params=request.query_template_params,
-        applicable_cv_ids=request.applicable_cv_ids,
-        label_guidance=request.label_guidance,
         partition_type=request.partition_type,
         partition_config=request.partition_config,
         is_materialized=False

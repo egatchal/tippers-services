@@ -124,48 +124,33 @@ async def run_snorkel_training(
     db.refresh(job)
 
     # TODO: Trigger Dagster pipeline
-    # from backend.utils.dagster_client import get_dagster_client
-    #
-    # run_config = {
-    #     "resources": {...},
-    #     "ops": {
-    #         "materialized_index": {
-    #             "config": {"storage_path": index.storage_path}
-    #         },
-    #         "labeling_functions": {
-    #             "config": {
-    #                 "lf_definitions": [
-    #                     {"lf_id": lf.lf_id, "lf_type": lf.lf_type, "lf_config": lf.lf_config}
-    #                     for lf in lfs
-    #                 ]
-    #             }
-    #         },
-    #         "trained_snorkel_model": {
-    #             "config": {
-    #                 "job_id": job.job_id,
-    #                 "epochs": request.snorkel.epochs,
-    #                 "lr": request.snorkel.lr,
-    #                 "output_type": request.snorkel.output_type,
-    #             }
-    #         }
-    #     }
-    # }
-    #
-    # dagster_client = get_dagster_client()
-    # result = dagster_client.submit_job_execution(
-    #     job_name="snorkel_training_pipeline",
-    #     run_config=run_config
-    # )
-    #
-    # job.dagster_run_id = result.run_id
-    # job.status = "RUNNING"
-    # db.commit()
-
-    # Placeholder: mark as running
-    job.dagster_run_id = f"placeholder-run-{job.job_id}"
+    from backend.utils.dagster_client import get_dagster_client
+    
+    run_config = {
+        "ops": {
+            "snorkel_training": {
+                "config": {
+                    "job_id": job.job_id,
+                }
+            }
+        }
+    }
+    
+    dagster_client = get_dagster_client()
+    result = dagster_client.submit_job_execution(
+        job_name="snorkel_training_pipeline",
+        run_config=run_config
+    )
+    
+    job.dagster_run_id = result.run_id
     job.status = "RUNNING"
     db.commit()
-    db.refresh(job)
+
+    # # Placeholder: mark as running
+    # job.dagster_run_id = f"placeholder-run-{job.job_id}"
+    # job.status = "RUNNING"
+    # db.commit()
+    # db.refresh(job)
 
     return job
 

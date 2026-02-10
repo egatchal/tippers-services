@@ -338,14 +338,21 @@ def materialized_rule(context: AssetExecutionContext, index_data: Dict[str, Any]
         session.close()
 
 
-def apply_custom_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
+def apply_custom_lf(df: pd.DataFrame, lf_config: dict, valid_cv_ids: set, cv_id_to_index: dict, context) -> np.ndarray:
     """
     Execute custom Python labeling function.
 
     Safely executes user-provided code against feature DataFrame.
-    """
-    import numpy as np
+    Returns values are remapped from cv_ids to 0-indexed class labels using cv_id_to_index.
+    -1 (ABSTAIN) is preserved as-is.
 
+    Args:
+        df: Feature DataFrame
+        lf_config: LF configuration with code and allowed_imports
+        valid_cv_ids: Set of valid cv_ids the LF may return
+        cv_id_to_index: Mapping from cv_id to 0-indexed class label
+        context: Dagster execution context
+    """
     code = lf_config.get("code", "")
     allowed_imports = lf_config.get("allowed_imports", [])
 
@@ -385,15 +392,17 @@ def apply_custom_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
         raise ValueError("Custom code must define a function named 'labeling_function'")
 
     # Apply to each row
-    labels = np.zeros(len(df), dtype=int)
+    labels = np.full(len(df), -1, dtype=int)
     for idx, row in df.iterrows():
         try:
             label = labeling_function(row)
-            # Ensure label is -1, 0, or 1
-            if label not in [-1, 0, 1]:
-                labels[idx] = -1  # Abstain on invalid output
+            if label == -1:
+                labels[idx] = -1  # Abstain
+            elif label in valid_cv_ids:
+                labels[idx] = cv_id_to_index[label]  # Remap cv_id to 0-indexed
             else:
-                labels[idx] = label
+                context.log.warning(f"LF returned invalid label {label} for row {idx}, abstaining")
+                labels[idx] = -1
         except Exception as e:
             context.log.warning(f"Error applying LF to row {idx}: {e}")
             labels[idx] = -1  # Abstain on error
@@ -401,108 +410,45 @@ def apply_custom_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
     return labels
 
 
-def apply_threshold_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
-    """
-    Execute threshold-based labeling function.
+def load_rule_features(rule_id: int, session, s3_resource, context) -> pd.DataFrame:
+    """Load materialized rule features from storage."""
+    result = session.execute(
+        text("SELECT storage_path FROM concept_rules WHERE r_id = :rule_id"),
+        {"rule_id": rule_id}
+    )
+    row = result.fetchone()
+    if not row or not row.storage_path:
+        raise ValueError(f"Rule {rule_id} has no materialized data")
 
-    Example config:
-    {
-        "feature": "visit_count",
-        "operator": ">",
-        "threshold": 50,
-        "label": 1
-    }
-    """
-    import numpy as np
+    storage_path = row.storage_path
 
-    feature = lf_config.get("feature")
-    operator = lf_config.get("operator")
-    threshold = lf_config.get("threshold")
-    label = lf_config.get("label", 1)
-
-    if feature not in df.columns:
-        context.log.error(f"Feature '{feature}' not found in DataFrame")
-        return np.full(len(df), -1, dtype=int)
-
-    labels = np.full(len(df), -1, dtype=int)  # Start with all abstain
-
-    # Apply threshold
-    if operator == ">":
-        mask = df[feature] > threshold
-    elif operator == ">=":
-        mask = df[feature] >= threshold
-    elif operator == "<":
-        mask = df[feature] < threshold
-    elif operator == "<=":
-        mask = df[feature] <= threshold
-    elif operator == "==":
-        mask = df[feature] == threshold
-    elif operator == "!=":
-        mask = df[feature] != threshold
+    if storage_path.startswith("s3://"):
+        s3_path_parts = storage_path.replace("s3://", "").split("/", 1)
+        s3_bucket = s3_path_parts[0]
+        s3_key = s3_path_parts[1]
+        local_path = f"/tmp/rule_{rule_id}.parquet"
+        s3_client = s3_resource.get_client()
+        s3_client.download_file(s3_bucket, s3_key, local_path)
+        return pd.read_parquet(local_path)
     else:
-        context.log.error(f"Unknown operator '{operator}'")
-        return labels
-
-    labels[mask] = label
-
-    return labels
-
-
-def apply_keyword_lf(df: pd.DataFrame, lf_config: dict, context) -> np.ndarray:
-    """
-    Execute keyword/regex-based labeling function.
-
-    Example config:
-    {
-        "field": "description",
-        "pattern": "high|premium|vip",
-        "label": 1
-    }
-    """
-    import numpy as np
-    import re
-
-    field = lf_config.get("field")
-    pattern = lf_config.get("pattern")
-    label = lf_config.get("label", 1)
-
-    if field not in df.columns:
-        context.log.error(f"Field '{field}' not found in DataFrame")
-        return np.full(len(df), -1, dtype=int)
-
-    labels = np.full(len(df), -1, dtype=int)
-
-    # Compile regex pattern
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except Exception as e:
-        context.log.error(f"Invalid regex pattern: {e}")
-        return labels
-
-    # Apply pattern matching
-    for idx, value in df[field].items():
-        if pd.notna(value) and regex.search(str(value)):
-            labels[idx] = label
-
-    return labels
+        return pd.read_parquet(storage_path)
 
 
 @asset(
     group_name="weak_supervision",
     description="Trains Snorkel label model and generates labels",
-    ins={"features": AssetIn("materialized_rule")},
     required_resource_keys={"s3_storage"}
 )
-def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -> Output[Dict[str, Any]]:
+def snorkel_training(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
     """
     Train Snorkel label model and generate probabilistic labels.
 
-    Loads feature data, applies labeling functions, builds label matrix,
-    trains Snorkel's LabelModel, and outputs predictions.
+    For each selected LF, loads the associated rule's materialized parquet,
+    joins all rule feature DataFrames, applies labeling functions with
+    cv_id-to-index remapping, and trains Snorkel's LabelModel.
 
     Returns metadata about the labeled dataset.
     """
-    # Get job_id from config
     job_id = context.op_config.get("job_id")
 
     if not job_id:
@@ -517,29 +463,16 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
         context.log.info(f"Loading Snorkel job metadata for job_id={job_id}")
 
         result = session.execute(
-            text("""
-            SELECT * FROM snorkel_jobs
-            WHERE job_id = :job_id
-            """),
+            text("SELECT * FROM snorkel_jobs WHERE job_id = :job_id"),
             {"job_id": job_id}
         )
-
         job_row = result.fetchone()
 
         if not job_row:
             raise ValueError(f"Snorkel job with ID {job_id} not found")
 
-        # Load feature data
-        features_storage_path = features["storage_path"]
-        context.log.info(f"Loading features from {features_storage_path}")
-
-        df_features = pd.read_parquet(features_storage_path)
-
-        context.log.info(f"Loaded {len(df_features)} rows of features")
-
         # Get labeling functions
         lf_ids = job_row.lf_ids
-
         if not lf_ids:
             raise ValueError("No labeling functions specified")
 
@@ -554,37 +487,54 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
             """),
             {"lf_ids": lf_ids}
         )
-
         lfs = lf_result.fetchall()
 
         context.log.info(f"Loaded {len(lfs)} active labeling functions")
 
-        # Apply labeling functions to create label matrix
-        # This is a simplified version - in production, use Snorkel's actual LF application
-        import numpy as np
+        # Build cv_id-to-index mapping from the union of all LFs' applicable_cv_ids
+        all_cv_ids = set()
+        for lf in lfs:
+            all_cv_ids.update(lf.applicable_cv_ids)
 
+        sorted_cv_ids = sorted(all_cv_ids)
+        cv_id_to_index = {cv_id: idx for idx, cv_id in enumerate(sorted_cv_ids)}
+        cardinality = len(sorted_cv_ids)
+
+        context.log.info(f"CV-ID-to-index mapping: {cv_id_to_index} (cardinality={cardinality})")
+
+        # Load and join rule feature DataFrames for each LF
+        s3_resource = context.resources.s3_storage
+        rule_dfs = {}
+        for lf in lfs:
+            if lf.rule_id not in rule_dfs:
+                context.log.info(f"Loading features for rule_id={lf.rule_id}")
+                rule_dfs[lf.rule_id] = load_rule_features(lf.rule_id, session, s3_resource, context)
+
+        # Join all rule feature DataFrames on index (outer join to keep all samples)
+        rule_ids = list(rule_dfs.keys())
+        df_features = rule_dfs[rule_ids[0]]
+        for rid in rule_ids[1:]:
+            df_features = df_features.join(rule_dfs[rid], how="outer", rsuffix=f"_rule{rid}")
+
+        context.log.info(f"Combined feature DataFrame: {len(df_features)} rows, {len(df_features.columns)} columns")
+
+        # Apply labeling functions to create label matrix
         n_samples = len(df_features)
         n_lfs = len(lfs)
-        L = np.zeros((n_samples, n_lfs), dtype=int)  # Label matrix
+        L = np.full((n_samples, n_lfs), -1, dtype=int)  # Label matrix, default abstain
 
         for i, lf in enumerate(lfs):
-            context.log.info(f"Applying LF {i+1}/{n_lfs}: {lf.name} (type: {lf.lf_type})")
+            context.log.info(f"Applying LF {i+1}/{n_lfs}: {lf.name}")
+
+            # Load the specific rule's features for this LF
+            lf_features = rule_dfs[lf.rule_id]
+            valid_cv_ids = set(lf.applicable_cv_ids)
 
             try:
-                # Execute LF based on type
-                if lf.lf_type == "custom":
-                    L[:, i] = apply_custom_lf(df_features, lf.lf_config, context)
-                elif lf.lf_type == "threshold":
-                    L[:, i] = apply_threshold_lf(df_features, lf.lf_config, context)
-                elif lf.lf_type == "keyword":
-                    L[:, i] = apply_keyword_lf(df_features, lf.lf_config, context)
-                else:
-                    context.log.warning(f"Unknown LF type '{lf.lf_type}', abstaining on all samples")
-                    L[:, i] = -1  # Abstain
-
+                L[:, i] = apply_custom_lf(lf_features, lf.lf_config, valid_cv_ids, cv_id_to_index, context)
             except Exception as e:
                 context.log.error(f"Error applying LF {lf.name}: {str(e)}")
-                L[:, i] = -1  # Abstain on error
+                L[:, i] = -1
 
         context.log.info("Label matrix created")
 
@@ -592,14 +542,13 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
         try:
             from snorkel.labeling import LabelModel
 
-            label_model = LabelModel(cardinality=2, verbose=True)
+            label_model = LabelModel(cardinality=cardinality, verbose=True)
 
-            # Get config
             config = job_row.config or {}
             epochs = config.get("epochs", 100)
             lr = config.get("lr", 0.01)
 
-            context.log.info(f"Training LabelModel (epochs={epochs}, lr={lr})")
+            context.log.info(f"Training LabelModel (epochs={epochs}, lr={lr}, cardinality={cardinality})")
 
             label_model.fit(
                 L_train=L,
@@ -617,23 +566,23 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
                 predictions = label_model.predict(L)
                 result_data = {
                     "labels": predictions.tolist(),
-                    "sample_ids": list(range(len(predictions)))
+                    "sample_ids": list(range(len(predictions))),
+                    "cv_id_to_index": cv_id_to_index
                 }
             else:  # softmax
                 probs = label_model.predict_proba(L)
                 result_data = {
                     "probabilities": probs.tolist(),
-                    "sample_ids": list(range(len(probs)))
+                    "sample_ids": list(range(len(probs))),
+                    "cv_id_to_index": cv_id_to_index
                 }
 
             # Update LF performance metrics
             lf_accuracies = label_model.get_weights()
 
             for i, lf in enumerate(lfs):
-                # Calculate coverage (% of samples not abstaining)
                 coverage = (L[:, i] != -1).sum() / n_samples
 
-                # Count conflicts
                 conflicts = 0
                 for j in range(n_lfs):
                     if i != j:
@@ -641,7 +590,6 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
                         disagree = L[both_vote, i] != L[both_vote, j]
                         conflicts += disagree.sum()
 
-                # Update LF metrics
                 session.execute(
                     text("""
                     UPDATE labeling_functions
@@ -661,19 +609,19 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
                 )
 
             session.commit()
-
             context.log.info("LF metrics updated")
 
         except ImportError:
             context.log.warning("Snorkel not installed. Using placeholder predictions.")
             result_data = {
                 "labels": [0] * n_samples,
-                "sample_ids": list(range(n_samples))
+                "sample_ids": list(range(n_samples)),
+                "cv_id_to_index": cv_id_to_index
             }
 
         # Store results locally
         local_storage_path = get_storage_path("snorkel_job", job_id)
-        local_storage_path = local_storage_path.replace('.parquet', '.json')  # Change extension for JSON
+        local_storage_path = local_storage_path.replace('.parquet', '.json')
 
         with open(local_storage_path, 'w') as f:
             json.dump(result_data, f)
@@ -732,7 +680,6 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
     except Exception as e:
         context.log.error(f"Error in Snorkel training: {str(e)}")
 
-        # Update job status to failed
         session.execute(
             text("""
             UPDATE snorkel_jobs
@@ -749,7 +696,6 @@ def snorkel_training(context: AssetExecutionContext, features: Dict[str, Any]) -
         )
 
         session.commit()
-
         raise
     finally:
         session.close()

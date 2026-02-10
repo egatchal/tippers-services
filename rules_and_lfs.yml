@@ -1,253 +1,107 @@
 # Rules and Labeling Functions Configuration
-# Generated from SQL queries for device classification concept
+# Postman-ready JSON bodies for device classification concept
+#
+# Concept value IDs (create these first):
+#   cv_id=1: STATIC (Intermittent static device)
+#   cv_id=2: LAPTOP (Weekday 9AM-9PM connections)
+#   cv_id=3: PHONE (Short daily sessions)
+
+# ============================================================================
+# Rules — POST /concepts/{c_id}/rules
+# Pure feature extraction, no label awareness
+# ============================================================================
 
 rules:
-  - name: static_short_irregular_sessions_rule
-    description: "Computes connection patterns for devices with short irregular sessions (<= 2 hours)"
-    index_column: mac_address
+  # POST /concepts/{c_id}/rules
+  - name: "static_short_irregular_sessions_rule"
+    index_id: 1
     sql_query: |
-      WITH connections as (
-        SELECT
-          mac_address,
-          SUM(CASE WHEN EXTRACT(EPOCH FROM (end_time - start_time)) / 3600 <= 2 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as connection_count,
-          COUNT(DISTINCT(space_id)) as distinct_ap
-        FROM user_location_trajectory
-        WHERE mac_address IN (:index_values)
-        GROUP BY mac_address
-      )
-      SELECT
-        mac_address,
-        connection_count,
-        distinct_ap
-      FROM connections
-    applicable_cv_ids:
-      - 1  # STATIC label
-    label_guidance:
-      STATIC: "Devices with >= 80% of connections being short irregular sessions (<= 2 hours) at single AP"
+      WITH connections AS (SELECT mac_address, SUM(CASE WHEN EXTRACT(EPOCH FROM (end_time - start_time)) / 3600 <= 2 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS connection_count, COUNT(DISTINCT(space_id)) AS distinct_ap FROM user_location_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address) SELECT mac_address, connection_count, distinct_ap FROM connections;
+    index_column: "mac_address"
 
-  - name: laptop_total_connected_duration_rule
-    description: "Computes percentage of weekday 9AM-9PM connections for laptop identification"
-    index_column: mac_address
+  # POST /concepts/{c_id}/rules
+  - name: "laptop_total_connected_duration_rule"
+    index_id: 1
     sql_query: |
-      WITH total_sessions AS (
-        SELECT *
-        FROM user_location_trajectory
-        WHERE mac_address IN (:index_values)
-      ),
-      total_connection_count AS (
-        SELECT mac_address, COUNT(*) AS total_count
-        FROM total_sessions
-        GROUP BY mac_address
-      ),
-      valid_connections AS (
-        SELECT mac_address
-        FROM total_sessions
-        WHERE
-          EXTRACT(DOW FROM start_time) BETWEEN 1 AND 5
-          AND EXTRACT(HOUR FROM start_time) >= 9
-          AND EXTRACT(HOUR FROM end_time) <= 21
-      ),
-      valid_connection_count AS (
-        SELECT mac_address, COUNT(*) AS valid_count
-        FROM valid_connections
-        GROUP BY mac_address
-      ),
-      valid_connection_percentage AS (
-        SELECT
-          t.mac_address,
-          v.valid_count * 1.0 / NULLIF(t.total_count, 0) AS percentage
-        FROM total_connection_count t
-        JOIN valid_connection_count v ON t.mac_address = v.mac_address
-      )
-      SELECT
-        mac_address,
-        percentage
-      FROM valid_connection_percentage
-    applicable_cv_ids:
-      - 2  # LAPTOP label
-    label_guidance:
-      LAPTOP: "Devices where 80% of connections fall on weekdays between 9 AM and 9 PM"
+      WITH total_sessions AS (SELECT * FROM user_location_trajectory WHERE mac_address IN (:index_values)), total_connection_count AS (SELECT mac_address, COUNT(*) AS total_count FROM total_sessions GROUP BY mac_address), valid_connections AS (SELECT mac_address FROM total_sessions WHERE EXTRACT(DOW FROM start_time) BETWEEN 1 AND 5 AND EXTRACT(HOUR FROM start_time) >= 9 AND EXTRACT(HOUR FROM end_time) <= 21), valid_connection_count AS (SELECT mac_address, COUNT(*) AS valid_count FROM valid_connections GROUP BY mac_address), valid_connection_percentage AS (SELECT t.mac_address, v.valid_count * 1.0 / NULLIF(t.total_count, 0) AS percentage FROM total_connection_count t JOIN valid_connection_count v ON t.mac_address = v.mac_address) SELECT mac_address, percentage FROM valid_connection_percentage;
+    index_column: "mac_address"
 
-  - name: phone_1_hour_average_rule
-    description: "Computes daily average connection duration for phone identification"
-    index_column: mac_address
+  # POST /concepts/{c_id}/rules
+  - name: "phone_1_hour_average_rule"
+    index_id: 1
     sql_query: |
-      WITH total_sessions AS (
-        SELECT *
-        FROM user_location_trajectory
-        WHERE mac_address IN (:index_values)
-      ),
-      daily_avg_connection_time AS (
-        SELECT
-          mac_address,
-          DATE(start_time) AS day,
-          SUM(EXTRACT(EPOCH FROM (end_time - start_time))) / COUNT(*) / 3600.0 AS avg_hours_per_connection
-        FROM total_sessions
-        GROUP BY mac_address, DATE(start_time)
-      ),
-      matched_days AS (
-        SELECT mac_address, day
-        FROM daily_avg_connection_time
-        WHERE avg_hours_per_connection <= 1
-      ),
-      user_day_counts AS (
-        SELECT
-          d.mac_address,
-          COUNT(DISTINCT d.day) AS total_days,
-          COUNT(DISTINCT m.day) AS qualifying_days
-        FROM daily_avg_connection_time d
-        LEFT JOIN matched_days m ON d.mac_address = m.mac_address AND d.day = m.day
-        GROUP BY d.mac_address
-      ),
-      qualified_users AS (
-        SELECT mac_address, total_days
-        FROM user_day_counts
-        WHERE qualifying_days * 1.0 / total_days >= 0.8
-          AND total_days >= 1
-      )
-      SELECT
-        mac_address,
-        total_days
-      FROM qualified_users
-    applicable_cv_ids:
-      - 3  # PHONE label
-    label_guidance:
-      PHONE: "Devices connected with average <= 1 hour daily sessions on 80% of all days"
+      WITH total_sessions AS (SELECT * FROM user_location_trajectory WHERE mac_address IN (:index_values)), daily_avg_connection_time AS (SELECT mac_address, DATE(start_time) AS day, SUM(EXTRACT(EPOCH FROM (end_time - start_time))) / COUNT(*) / 3600.0 AS avg_hours_per_connection FROM total_sessions GROUP BY mac_address, DATE(start_time)), matched_days AS (SELECT mac_address, day FROM daily_avg_connection_time WHERE avg_hours_per_connection <= 1), user_day_counts AS (SELECT d.mac_address, COUNT(DISTINCT d.day) AS total_days, COUNT(DISTINCT m.day) AS qualifying_days FROM daily_avg_connection_time d LEFT JOIN matched_days m ON d.mac_address = m.mac_address AND d.day = m.day GROUP BY d.mac_address), qualified_users AS (SELECT mac_address, total_days FROM user_day_counts WHERE qualifying_days * 1.0 / total_days >= 0.8 AND total_days >= 1) SELECT mac_address, total_days FROM qualified_users;
+    index_column: "mac_address"
 
+
+# ============================================================================
+# Labeling Functions — POST /concepts/{c_id}/labeling-functions
+# Custom Python only, with multi-CV support
+# ============================================================================
 
 labeling_functions:
-  - name: static_short_irregular_sessions_lf
-    description: "Identifies static devices by >= 80% short connections at single AP"
-    rule_name: static_short_irregular_sessions_rule
-    cv_id: 1  # STATIC label
-    lf_type: threshold
-    lf_config:
-      conditions:
-        - feature: connection_count
-          operator: ">="
-          threshold: 0.8
-        - feature: distinct_ap
-          operator: "=="
-          value: 1
-      label: 1  # Vote STATIC (1) if all conditions met, abstain (-1) otherwise
-      logic: "AND"  # All conditions must be true
+  # POST /concepts/{c_id}/labeling-functions
+  - name: "static_short_irregular_sessions_lf"
+    rule_id: 1
+    applicable_cv_ids: [1, 2, 3]
+    code: |
+      STATIC = 1
+      ABSTAIN = -1
 
-  - name: laptop_total_connected_duration_lf
-    description: "Identifies laptops by >= 80% weekday 9AM-9PM connections"
-    rule_name: laptop_total_connected_duration_rule
-    cv_id: 2  # LAPTOP label
-    lf_type: threshold
-    lf_config:
-      conditions:
-        - feature: percentage
-          operator: ">="
-          threshold: 0.8
-      label: 1  # Vote LAPTOP (cv_id=2) if condition met
-      logic: "AND"
+      def labeling_function(row):
+          if row['connection_count'] >= 0.8 and row['distinct_ap'] == 1:
+              return STATIC
+          return ABSTAIN
+    allowed_imports: []
 
-  - name: phone_1_hour_average_lf
-    description: "Identifies phones by >= 1 day of activity (rule pre-filters qualifying devices)"
-    rule_name: phone_1_hour_average_rule
-    cv_id: 3  # PHONE label
-    lf_type: threshold
-    lf_config:
-      conditions:
-        - feature: total_days
-          operator: ">="
-          threshold: 1
-      label: 1  # Vote PHONE (cv_id=3) if condition met (rule already filters for 80% qualifying days)
-      logic: "AND"
+  # POST /concepts/{c_id}/labeling-functions
+  - name: "laptop_total_connected_duration_lf"
+    rule_id: 2
+    applicable_cv_ids: [1, 2, 3]
+    code: |
+      LAPTOP = 2
+      ABSTAIN = -1
 
+      def labeling_function(row):
+          if row['percentage'] >= 0.8:
+              return LAPTOP
+          return ABSTAIN
+    allowed_imports: []
 
-# Alternative: Custom LF implementations if threshold LFs don't support multi-condition logic
-custom_labeling_functions:
-  - name: static_short_irregular_sessions_custom_lf
-    description: "Custom Python implementation for static device identification"
-    rule_name: static_short_irregular_sessions_rule
-    cv_id: 1
-    lf_type: custom
-    lf_config:
-      code: |
-        def labeling_function(row):
-            """
-            Identifies static devices with >= 80% short irregular sessions at single AP.
-            Returns: 1 (STATIC), -1 (ABSTAIN)
-            """
-            if row['connection_count'] >= 0.8 and row['distinct_ap'] == 1:
-                return 1  # Vote STATIC
-            return -1  # Abstain
-      allowed_imports: []
-      label: 1
+  # POST /concepts/{c_id}/labeling-functions
+  - name: "phone_1_hour_average_lf"
+    rule_id: 3
+    applicable_cv_ids: [1, 2, 3]
+    code: |
+      PHONE = 3
+      ABSTAIN = -1
 
-  - name: laptop_total_connected_duration_custom_lf
-    description: "Custom Python implementation for laptop identification"
-    rule_name: laptop_total_connected_duration_rule
-    cv_id: 2
-    lf_type: custom
-    lf_config:
-      code: |
-        def labeling_function(row):
-            """
-            Identifies laptops by >= 80% weekday 9AM-9PM connections.
-            Returns: 1 (LAPTOP), -1 (ABSTAIN)
-            """
-            if row['percentage'] >= 0.8:
-                return 1  # Vote LAPTOP
-            return -1  # Abstain
-      allowed_imports: []
-      label: 1
-
-  - name: phone_1_hour_average_custom_lf
-    description: "Custom Python implementation for phone identification"
-    rule_name: phone_1_hour_average_rule
-    cv_id: 3
-    lf_type: custom
-    lf_config:
-      code: |
-        def labeling_function(row):
-            """
-            Identifies phones by daily average <= 1 hour on 80% of days.
-            Rule pre-filters, so just check total_days >= 1.
-            Returns: 1 (PHONE), -1 (ABSTAIN)
-            """
-            if row['total_days'] >= 1:
-                return 1  # Vote PHONE
-            return -1  # Abstain
-      allowed_imports: []
-      label: 1
+      def labeling_function(row):
+          if row['total_days'] >= 1:
+              return PHONE
+          return ABSTAIN
+    allowed_imports: []
 
 
 # Notes:
 # -------------------------
-# 1. All queries converted from Jinja2 syntax: WHERE mac_address IN ('{{ mac_address|join("', '") }}')
-#    to placeholder syntax: WHERE mac_address IN (:index_values)
+# 1. Each rule/LF entry above can be copied directly as a JSON body in Postman.
+#    Just convert YAML to JSON (keys are the same as the Pydantic schema fields).
 #
-# 2. Rules extract features from the user_location_trajectory table
-#    - static_short_irregular_sessions_rule: Percentage of connections <= 2 hours, distinct APs
-#    - laptop_total_connected_duration_rule: Percentage of weekday 9AM-9PM connections
-#    - phone_1_hour_average_rule: Daily average connection time, qualifying days
+# 2. LFs now return cv_id values (e.g., STATIC=1, LAPTOP=2, PHONE=3) or ABSTAIN=-1.
+#    The Dagster snorkel_training asset remaps cv_ids to 0-indexed class labels.
 #
-# 3. LFs implement the original WHERE clause conditions as threshold or custom logic
-#    - STATIC: connection_count >= 0.8 AND distinct_ap = 1
-#    - LAPTOP: percentage >= 0.8
-#    - PHONE: total_days >= 1 (rule already filters for 80% qualifying days)
+# 3. applicable_cv_ids on LFs declares which concept values the LF may vote on.
+#    Snorkel cardinality is determined from the union of all selected LFs' applicable_cv_ids.
 #
-# 4. The 'threshold' LF type requires multi-condition support in backend/dagster_app/assets.py
-#    If not supported, use the 'custom' LF implementations provided
+# 4. Rules are pure feature extraction with no label awareness.
+#    applicable_cv_ids and label_guidance have been removed from rules.
 #
-# 5. Concept value IDs (cv_id) should be created in order:
-#    - cv_id=1: STATIC (Intermittent static device)
-#    - cv_id=2: LAPTOP (Weekday 9AM-9PM connections)
-#    - cv_id=3: PHONE (Short daily sessions)
-#
-# 6. To use this configuration:
-#    a) Create an index that samples mac_addresses from user_location_trajectory table
-#    b) Create rules using the sql_query definitions (they reference :index_values)
-#    c) Materialize the rules to compute features
-#    d) Create LFs referencing the rule_id
-#    e) Run Snorkel training with selected index, rules, and LFs
-#
-# 7. Table and column names:
-#    - Table: user_location_trajectory
-#    - Index column: mac_address
-#    - Columns: start_time, end_time, space_id
+# 5. To use this configuration:
+#    a) Create concept values: STATIC (cv_id=1), LAPTOP (cv_id=2), PHONE (cv_id=3)
+#    b) Create an index that samples mac_addresses from user_location_trajectory
+#    c) Create rules using POST /concepts/{c_id}/rules with the entries above
+#    d) Materialize each rule
+#    e) Create LFs using POST /concepts/{c_id}/labeling-functions with the entries above
+#    f) Approve each LF via POST /concepts/{c_id}/labeling-functions/{lf_id}/approve
+#    g) Run Snorkel training with selected LFs

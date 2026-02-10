@@ -56,6 +56,7 @@ class DagsterClient:
 
         response.raise_for_status()
         data = response.json()
+        print(data)
 
         if "errors" in data:
             raise Exception(f"GraphQL error: {data['errors']}")

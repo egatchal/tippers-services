@@ -167,8 +167,6 @@ class RuleCreate(BaseModel):
     sql_query: str = Field(..., description="SQL query with :index_values placeholder (e.g., WHERE user_id IN (:index_values))")
     index_column: Optional[str] = Field(None, description="Column from index to extract for filtering (e.g., 'user_id'). Defaults to first column if not specified.")
     query_template_params: Optional[Dict[str, Any]] = Field(None, description="Optional additional Jinja2 template parameters")
-    applicable_cv_ids: Optional[List[int]] = Field(None, description="Concept value IDs this rule can identify")
-    label_guidance: Optional[Dict[str, Any]] = Field(None, description="Guidance for creating LFs per label")
     partition_type: Optional[str] = Field(None, description="Partition type: time, id_range, categorical")
     partition_config: Optional[Dict[str, Any]] = Field(None, description="Partition configuration")
 
@@ -180,8 +178,6 @@ class RuleUpdate(BaseModel):
     sql_query: Optional[str] = None
     index_column: Optional[str] = None
     query_template_params: Optional[Dict[str, Any]] = None
-    applicable_cv_ids: Optional[List[int]] = None
-    label_guidance: Optional[Dict[str, Any]] = None
     partition_type: Optional[str] = None
     partition_config: Optional[Dict[str, Any]] = None
 
@@ -195,8 +191,6 @@ class RuleResponse(BaseModel):
     sql_query: str
     index_column: Optional[str]
     query_template_params: Optional[Dict[str, Any]]
-    applicable_cv_ids: Optional[List[int]]
-    label_guidance: Optional[Dict[str, Any]]
     partition_type: Optional[str]
     partition_config: Optional[Dict[str, Any]]
     storage_path: Optional[str]
@@ -222,45 +216,13 @@ class RuleMaterializeResponse(BaseModel):
 # ============================================================================
 
 class LabelingFunctionCreate(BaseModel):
-    """Schema for creating a labeling function."""
+    """Schema for creating a labeling function (custom Python only)."""
     name: str = Field(..., description="LF name")
     rule_id: int = Field(..., description="Rule ID that provides features")
-    cv_id: int = Field(..., description="Concept value ID (label to vote for)")
-    lf_type: str = Field(..., description="LF type: threshold, keyword, sql, custom")
-    lf_config: Dict[str, Any] = Field(..., description="LF configuration")
-    parent_lf_id: Optional[int] = Field(None, description="Parent LF ID for versioning")
-
-
-class TemplateLFCreate(BaseModel):
-    """Schema for creating a template-based labeling function."""
-    name: str
-    rule_id: int = Field(..., description="Rule ID that provides features")
-    cv_id: int = Field(..., description="Concept value ID (label)")
-    template: str = Field(..., description="Template name")
-    field: str = Field(..., description="Field to evaluate")
-    operator: str = Field(..., description="Operator: >, <, ==, !=, >=, <=")
-    value: Any = Field(..., description="Value to compare")
-    label: int = Field(..., description="Label to apply if condition met")
-
-
-class RegexLFCreate(BaseModel):
-    """Schema for creating a regex-based labeling function."""
-    name: str
-    rule_id: int = Field(..., description="Rule ID that provides features")
-    cv_id: int
-    pattern: str = Field(..., description="Regex pattern")
-    field: str = Field(..., description="Field to match against")
-    label: int = Field(..., description="Label to apply if pattern matches")
-
-
-class CustomLFCreate(BaseModel):
-    """Schema for creating a custom Python labeling function."""
-    name: str
-    rule_id: int = Field(..., description="Rule ID that provides features")
-    cv_id: int
-    code: str = Field(..., description="Python code for labeling function")
+    applicable_cv_ids: List[int] = Field(..., description="Concept value IDs this LF can vote on")
+    code: Optional[str] = Field(None, description="Python code for labeling function. If omitted, a template is auto-generated.")
     allowed_imports: List[str] = Field(default_factory=list, description="Allowed import modules")
-    label: int
+    parent_lf_id: Optional[int] = Field(None, description="Parent LF ID for versioning")
 
 
 class LabelingFunctionUpdate(BaseModel):
@@ -274,7 +236,7 @@ class LabelingFunctionResponse(BaseModel):
     """Schema for labeling function response."""
     lf_id: int
     c_id: int
-    cv_id: int
+    applicable_cv_ids: List[int]
     rule_id: int
     name: str
     version: int
