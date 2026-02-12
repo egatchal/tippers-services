@@ -24,6 +24,7 @@ class ConceptValue(Base):
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     display_order = Column(Integer, nullable=True)
+    level = Column(Integer, default=1, nullable=False, server_default='1')
     created_at = Column(TIMESTAMP, server_default=func.now())
 
 
@@ -58,6 +59,7 @@ class ConceptIndex(Base):
     is_materialized = Column(Boolean, default=False)
     materialized_at = Column(TIMESTAMP, nullable=True)
     row_count = Column(Integer, nullable=True)
+    column_stats = Column(JSON, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -80,6 +82,7 @@ class ConceptRule(Base):
     is_materialized = Column(Boolean, default=False)
     materialized_at = Column(TIMESTAMP, nullable=True)
     row_count = Column(Integer, nullable=True)
+    column_stats = Column(JSON, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -147,6 +150,51 @@ class SnorkelJob(Base):
     # }
 
     output_type = Column(String(50), default='hard_labels')
+    dagster_run_id = Column(String(255), nullable=True)
+    status = Column(String(50), default='PENDING')
+    result_path = Column(String(500), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    completed_at = Column(TIMESTAMP, nullable=True)
+
+
+class ConceptFeature(Base):
+    """Concept features table - simple SQL aggregations used as classifier training inputs."""
+    __tablename__ = "concept_features"
+
+    feature_id = Column(Integer, primary_key=True, autoincrement=True)
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    index_id = Column(Integer, ForeignKey('concept_indexes.index_id'), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    sql_query = Column(Text, nullable=False)
+    index_column = Column(String(255), nullable=True)
+    columns = Column(ARRAY(String), nullable=True)
+    query_template_params = Column(JSON, nullable=True)
+    level = Column(Integer, nullable=True)
+    partition_type = Column(String(50), nullable=True)
+    partition_config = Column(JSON, nullable=True)
+    storage_path = Column(String(500), nullable=True)
+    is_materialized = Column(Boolean, default=False)
+    materialized_at = Column(TIMESTAMP, nullable=True)
+    row_count = Column(Integer, nullable=True)
+    column_stats = Column(JSON, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class ClassifierJob(Base):
+    """Classifier training jobs table - trains classifiers on Snorkel-labeled data with features."""
+    __tablename__ = "classifier_jobs"
+
+    job_id = Column(Integer, primary_key=True, autoincrement=True)
+    c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
+    snorkel_job_id = Column(Integer, ForeignKey('snorkel_jobs.job_id'), nullable=False)
+    feature_ids = Column(ARRAY(Integer), nullable=False)
+
+    config = Column(JSON, nullable=False)
+
     dagster_run_id = Column(String(255), nullable=True)
     status = Column(String(50), default='PENDING')
     result_path = Column(String(500), nullable=True)

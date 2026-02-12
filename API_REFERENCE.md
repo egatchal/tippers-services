@@ -11,10 +11,12 @@ Complete API reference for all endpoints. Base URL: `http://localhost:8000`
 5. [Indexes](#indexes)
 6. [Rules](#rules)
 7. [Labeling Functions](#labeling-functions)
-8. [Asset Catalog](#asset-catalog)
-9. [Snorkel Training](#snorkel-training)
-10. [Dagster Integration](#dagster-integration)
-11. [Common Patterns](#common-patterns)
+8. [Features](#features)
+9. [Asset Catalog](#asset-catalog)
+10. [Snorkel Training](#snorkel-training)
+11. [Classifiers](#classifiers)
+12. [Dagster Integration](#dagster-integration)
+13. [Common Patterns](#common-patterns)
 
 ---
 
@@ -783,6 +785,153 @@ Returns all versions in the version chain (from root to latest), ordered by vers
 
 ---
 
+## Features
+
+**Simple SQL aggregations** used as training inputs for downstream classifiers. Features are lighter than rules — typically a single `SELECT ... GROUP BY` producing a few columns per entity.
+
+Features differ from rules:
+- Features have `description`, `columns` (expected output column names), and `level` (UI display) fields
+- Features are used as classifier training inputs (not LF inputs)
+- Features use the same `:index_values` placeholder pattern as rules
+
+### Create Feature
+```http
+POST /concepts/{c_id}/features
+```
+
+**Request Body:**
+```json
+{
+  "name": "mean_session_duration",
+  "index_id": 1,
+  "sql_query": "SELECT mac_address, AVG(EXTRACT(EPOCH FROM (end_time - start_time))) AS mean_interval FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address",
+  "index_column": "mac_address",
+  "columns": ["mean_interval"],
+  "description": "Calculates the average session duration in seconds for each MAC address",
+  "level": 1
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique feature name within the concept |
+| `index_id` | integer | Yes | Index ID to use as sample set |
+| `sql_query` | string | Yes | SQL query with `:index_values` placeholder |
+| `index_column` | string | No | Column from index for filtering (defaults to first column) |
+| `columns` | string[] | No | Expected output column names |
+| `query_template_params` | object | No | Jinja2 template parameters |
+| `description` | string | No | Feature description |
+| `level` | integer | No | UI display level |
+| `partition_type` | string | No | Partition type: `time`, `id_range`, `categorical` |
+| `partition_config` | object | No | Partition configuration |
+
+**Requirements:**
+- SQL must start with `SELECT` or `WITH`
+- Name must be unique within the concept
+- The referenced index must belong to the same concept
+
+**Response (201):**
+```json
+{
+  "feature_id": 1,
+  "c_id": 1,
+  "index_id": 1,
+  "name": "mean_session_duration",
+  "description": "Calculates the average session duration in seconds for each MAC address",
+  "sql_query": "SELECT mac_address, AVG(...) AS mean_interval FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address",
+  "index_column": "mac_address",
+  "columns": ["mean_interval"],
+  "query_template_params": null,
+  "level": 1,
+  "partition_type": null,
+  "partition_config": null,
+  "storage_path": null,
+  "is_materialized": false,
+  "materialized_at": null,
+  "row_count": null,
+  "created_at": "2024-01-15T10:00:00Z",
+  "updated_at": "2024-01-15T10:00:00Z"
+}
+```
+
+### List Features
+```http
+GET /concepts/{c_id}/features?skip=0&limit=100
+```
+
+**Response (200):** Array of `FeatureResponse`.
+
+### Get Feature
+```http
+GET /concepts/{c_id}/features/{feature_id}
+```
+
+**Response (200):** Single `FeatureResponse`.
+
+### Update Feature
+```http
+PATCH /concepts/{c_id}/features/{feature_id}
+```
+
+**Request Body (partial update):**
+```json
+{
+  "description": "Updated description",
+  "sql_query": "SELECT mac_address, COUNT(*) AS total_conn FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | No | New feature name |
+| `sql_query` | string | No | New SQL query |
+| `index_column` | string | No | New index column |
+| `columns` | string[] | No | New output column names |
+| `query_template_params` | object | No | New template parameters |
+| `description` | string | No | New description |
+| `level` | integer | No | New UI level |
+| `partition_type` | string | No | New partition type |
+| `partition_config` | object | No | New partition configuration |
+
+Updating `sql_query` or `query_template_params` resets materialization status.
+
+**Response (200):** Updated `FeatureResponse`.
+
+### Delete Feature
+```http
+DELETE /concepts/{c_id}/features/{feature_id}
+```
+
+**Response:** `204 No Content`
+
+### Materialize Feature
+```http
+POST /concepts/{c_id}/features/{feature_id}/materialize
+```
+
+Triggers Dagster to execute the SQL query and store results to S3.
+
+**Requirements:**
+- The feature's referenced index must be materialized first
+
+**Response (200):**
+```json
+{
+  "feature_id": 1,
+  "dagster_run_id": "feat123xyz",
+  "status": "STARTED"
+}
+```
+
+**How `:index_values` works (same as rules):**
+1. The index query returns sample records (e.g., 5000 mac_addresses)
+2. The system extracts the `index_column` values
+3. `:index_values` is replaced with those values in the feature's SQL query
+4. The query executes against the external database
+5. Results are stored as Parquet in S3
+
+---
+
 ## Asset Catalog
 
 Browse available data assets (indexes and rules) for building Snorkel pipelines.
@@ -976,6 +1125,166 @@ Can only cancel jobs with status `PENDING` or `RUNNING`.
 
 ---
 
+## Classifiers
+
+Train a bank of classifiers on Snorkel-labeled data joined with materialized features. Uses [LazyClassifier](https://lazypredict.readthedocs.io/) to automatically train and rank 30+ models.
+
+**Pipeline:** Snorkel probabilistic labels are filtered by confidence threshold, joined with feature data, then fed into LazyClassifier for automated model selection.
+
+### Run Classifier Training
+```http
+POST /concepts/{c_id}/classifiers/run
+```
+
+**Request Body:**
+```json
+{
+  "snorkel_job_id": 1,
+  "feature_ids": [1, 2, 3, 4, 5],
+  "config": {
+    "threshold_method": "max_confidence",
+    "threshold_value": 0.7,
+    "min_labels_per_class": 10,
+    "imbalance_factor": 3.0,
+    "test_size": 0.2,
+    "random_state": 42
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `snorkel_job_id` | integer | Yes | Snorkel job ID whose labels to use |
+| `feature_ids` | int[] | Yes | Feature IDs to join as training data |
+| `config.threshold_method` | string | No | `max_confidence` or `entropy` (default: `max_confidence`) |
+| `config.threshold_value` | float | No | Confidence threshold for filtering (default: `0.7`) |
+| `config.min_labels_per_class` | integer | No | Minimum samples per class after filtering (default: `10`) |
+| `config.imbalance_factor` | float | No | Max ratio of largest to smallest class (default: `3.0`) |
+| `config.test_size` | float | No | Test set fraction (default: `0.2`) |
+| `config.random_state` | integer | No | Random seed (default: `42`) |
+
+**Validation:**
+- Snorkel job must exist for this concept and be `COMPLETED`
+- All feature_ids must exist for this concept and be materialized
+- `threshold_method` must be `entropy` or `max_confidence`
+
+**Response (201):**
+```json
+{
+  "job_id": 1,
+  "c_id": 1,
+  "snorkel_job_id": 1,
+  "feature_ids": [1, 2, 3, 4, 5],
+  "config": {
+    "threshold_method": "max_confidence",
+    "threshold_value": 0.7,
+    "min_labels_per_class": 10,
+    "imbalance_factor": 3.0,
+    "test_size": 0.2,
+    "random_state": 42
+  },
+  "dagster_run_id": "clf123xyz",
+  "status": "RUNNING",
+  "result_path": null,
+  "error_message": null,
+  "created_at": "2024-01-15T11:00:00Z",
+  "completed_at": null
+}
+```
+
+### List Classifier Jobs
+```http
+GET /concepts/{c_id}/classifiers/jobs?skip=0&limit=100
+```
+
+Returns jobs ordered by `created_at` descending.
+
+**Response (200):** Array of `ClassifierJobResponse`.
+
+### Get Classifier Job
+```http
+GET /concepts/{c_id}/classifiers/jobs/{job_id}
+```
+
+**Response (200):** Single `ClassifierJobResponse`.
+
+### Get Classifier Results
+```http
+GET /concepts/{c_id}/classifiers/jobs/{job_id}/results
+```
+
+**Response (200) — Job not complete:**
+```json
+{
+  "job_id": 1,
+  "status": "RUNNING",
+  "message": "Job is RUNNING. Results not available yet."
+}
+```
+
+**Response (200) — Job complete:**
+```json
+{
+  "job_id": 1,
+  "status": "COMPLETED",
+  "filtering_stats": {
+    "samples_before_filter": 5000,
+    "samples_after_filter": 3200,
+    "confidence_before_filter": 0.62,
+    "confidence_after_filter": 0.85,
+    "filter_retention_rate": 0.64,
+    "class_distribution_after_filter": {
+      "STATIC": 1200,
+      "LAPTOP": 1100,
+      "PHONE": 900
+    }
+  },
+  "model_scores": [
+    {
+      "Model": "RandomForestClassifier",
+      "Accuracy": 0.94,
+      "Balanced Accuracy": 0.93,
+      "F1 Score": 0.94,
+      "Time Taken": 1.2
+    },
+    {
+      "Model": "LGBMClassifier",
+      "Accuracy": 0.92,
+      "Balanced Accuracy": 0.91,
+      "F1 Score": 0.92,
+      "Time Taken": 0.8
+    }
+  ],
+  "num_models_trained": 28,
+  "config_used": {
+    "threshold_method": "max_confidence",
+    "threshold_value": 0.7,
+    "min_labels_per_class": 10,
+    "imbalance_factor": 3.0,
+    "test_size": 0.2,
+    "random_state": 42
+  }
+}
+```
+
+### Delete Classifier Job
+```http
+DELETE /concepts/{c_id}/classifiers/jobs/{job_id}
+```
+
+**Response:** `204 No Content`
+
+### Cancel Classifier Job
+```http
+POST /concepts/{c_id}/classifiers/jobs/{job_id}/cancel
+```
+
+Can only cancel jobs with status `PENDING` or `RUNNING`.
+
+**Response (200):** Updated `ClassifierJobResponse` with `status: "CANCELLED"`.
+
+---
+
 ## Dagster Integration
 
 Monitor and manage Dagster job execution. All endpoints are prefixed with `/dagster`.
@@ -1072,7 +1381,7 @@ GET /dagster/health
 
 ## Common Patterns
 
-### Complete Workflow: Concept -> Index -> Rule -> LF -> Snorkel
+### Complete Workflow: Concept -> Index -> Rule -> LF -> Snorkel -> Features -> Classifier
 
 #### Step 1: Create Database Connection
 ```http
@@ -1203,27 +1512,98 @@ POST /concepts/1/snorkel/run
 ```
 Response: `{"job_id": 1, "dagster_run_id": "ghi789", "status": "RUNNING", ...}`
 
-#### Step 12: Monitor and Retrieve Results
+#### Step 12: Monitor Snorkel and Retrieve Results
 ```http
 GET /concepts/1/snorkel/jobs/1
 GET /concepts/1/snorkel/jobs/1/results
 ```
+
+#### Step 13: Create Features
+```http
+POST /concepts/1/features
+
+{
+  "name": "mean_session_duration",
+  "index_id": 1,
+  "sql_query": "SELECT mac_address, AVG(EXTRACT(EPOCH FROM (end_time - start_time))) AS mean_interval FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address",
+  "index_column": "mac_address",
+  "columns": ["mean_interval"],
+  "description": "Average session duration in seconds",
+  "level": 1
+}
+```
+Response: `{"feature_id": 1, ...}`
+
+Repeat for each feature (`total_connections`, `num_days_connected`, `start_end_dates`, `unique_ap`).
+
+#### Step 14: Materialize Features
+```http
+POST /concepts/1/features/1/materialize
+POST /concepts/1/features/2/materialize
+POST /concepts/1/features/3/materialize
+POST /concepts/1/features/4/materialize
+POST /concepts/1/features/5/materialize
+```
+Response: `{"feature_id": 1, "dagster_run_id": "feat123", "status": "STARTED"}`
+
+Monitor: `GET /dagster/runs/{run_id}` — wait for `"status": "SUCCESS"`.
+
+#### Step 15: Run Classifier Training
+```http
+POST /concepts/1/classifiers/run
+
+{
+  "snorkel_job_id": 1,
+  "feature_ids": [1, 2, 3, 4, 5],
+  "config": {
+    "threshold_method": "max_confidence",
+    "threshold_value": 0.7,
+    "min_labels_per_class": 10,
+    "imbalance_factor": 3.0,
+    "test_size": 0.2,
+    "random_state": 42
+  }
+}
+```
+Response: `{"job_id": 1, "dagster_run_id": "clf789", "status": "RUNNING", ...}`
+
+#### Step 16: Retrieve Classifier Results
+```http
+GET /concepts/1/classifiers/jobs/1/results
+```
+
+Returns filtering stats (before/after sample counts, confidence improvement) and ranked model scores (30+ classifiers with Accuracy, Balanced Accuracy, F1, etc.).
 
 ---
 
 ### Quick Reference: Data Flow
 
 ```
-Index (Sampling)  -->  Rule (Features)  -->  LF (Voting)  -->  Snorkel (Training)
+Index (Sampling)
+  |
+  +-- Rule (Features) --> LF (Voting) --> Snorkel (Training) --> Probabilistic Labels
+  |                                                                      |
+  +-- Feature (Simple SQL Aggregations) --------------------------------+
+                                                                         |
+                                                                         v
+                                                              Classifier Training
+                                                              (filter labels, join features, LazyClassifier)
+                                                                         |
+                                                                         v
+                                                              Model Scores (30+ classifiers ranked)
 ```
 
 **Index** — Defines which records to work with (e.g., 5000 mac_addresses).
 
-**Rule** — Computes features for sampled records. Uses `:index_values` placeholder. Pure feature extraction, no label awareness.
+**Rule** — Computes features for sampled records. Uses `:index_values` placeholder. Pure feature extraction, no label awareness. Used by labeling functions.
 
 **Labeling Function** — Custom Python code that votes on concept values using rule features. Declares `applicable_cv_ids`. Returns a `cv_id` or `-1` (abstain).
 
 **Snorkel** — Resolves LF disagreements via `LabelModel`. Cardinality is determined from the union of all selected LFs' `applicable_cv_ids`. LF return values (cv_ids) are remapped to 0-indexed class labels internally.
+
+**Feature** — Simple SQL aggregations (e.g., `mean_session_duration`, `total_connections`). Uses `:index_values` placeholder. Used as training inputs for classifiers (not for labeling functions).
+
+**Classifier** — Takes Snorkel's probabilistic labels, filters by confidence/entropy threshold, joins feature data, and trains 30+ classifiers via LazyClassifier. Returns ranked model scores.
 
 ---
 

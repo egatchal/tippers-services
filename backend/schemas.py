@@ -41,6 +41,7 @@ class ConceptValueCreate(BaseModel):
     name: str = Field(..., description="Label name (e.g., HIGH_VALUE, LOW_VALUE)")
     description: Optional[str] = Field(None, description="Label description")
     display_order: Optional[int] = Field(None, description="Display order in UI")
+    level: int = Field(default=1, description="Classification level (1=top-level, 2=sub-level, etc.)")
 
 
 class ConceptValueUpdate(BaseModel):
@@ -48,6 +49,7 @@ class ConceptValueUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     display_order: Optional[int] = None
+    level: Optional[int] = None
 
 
 class ConceptValueResponse(BaseModel):
@@ -57,6 +59,7 @@ class ConceptValueResponse(BaseModel):
     name: str
     description: Optional[str]
     display_order: Optional[int]
+    level: int = 1
     created_at: datetime
 
     class Config:
@@ -142,6 +145,7 @@ class IndexResponse(BaseModel):
     is_materialized: bool
     materialized_at: Optional[datetime]
     row_count: Optional[int]
+    column_stats: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 
@@ -197,6 +201,7 @@ class RuleResponse(BaseModel):
     is_materialized: bool
     materialized_at: Optional[datetime]
     row_count: Optional[int]
+    column_stats: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 
@@ -230,6 +235,7 @@ class LabelingFunctionUpdate(BaseModel):
     name: Optional[str] = None
     is_active: Optional[bool] = None
     lf_config: Optional[Dict[str, Any]] = None
+    applicable_cv_ids: Optional[List[int]] = None
 
 
 class LabelingFunctionResponse(BaseModel):
@@ -358,3 +364,108 @@ class DagsterRunStatusResponse(BaseModel):
     start_time: Optional[datetime]
     end_time: Optional[datetime]
     error_message: Optional[str]
+
+
+# ============================================================================
+# Feature Schemas
+# ============================================================================
+
+class FeatureCreate(BaseModel):
+    """Schema for creating a feature."""
+    name: str = Field(..., description="Feature name")
+    index_id: int = Field(..., description="Index ID to use as sample set")
+    sql_query: str = Field(..., description="SQL query with :index_values placeholder")
+    index_column: Optional[str] = Field(None, description="Column from index for filtering (defaults to first column)")
+    columns: Optional[List[str]] = Field(None, description="Expected output column names")
+    query_template_params: Optional[Dict[str, Any]] = Field(None, description="Jinja2 template parameters")
+    description: Optional[str] = Field(None, description="Feature description")
+    level: Optional[int] = Field(None, description="UI display level")
+    partition_type: Optional[str] = Field(None, description="Partition type")
+    partition_config: Optional[Dict[str, Any]] = Field(None, description="Partition configuration")
+
+
+class FeatureUpdate(BaseModel):
+    """Schema for updating a feature."""
+    name: Optional[str] = None
+    sql_query: Optional[str] = None
+    index_column: Optional[str] = None
+    columns: Optional[List[str]] = None
+    query_template_params: Optional[Dict[str, Any]] = None
+    description: Optional[str] = None
+    level: Optional[int] = None
+    partition_type: Optional[str] = None
+    partition_config: Optional[Dict[str, Any]] = None
+
+
+class FeatureResponse(BaseModel):
+    """Schema for feature response."""
+    feature_id: int
+    c_id: int
+    index_id: int
+    name: str
+    description: Optional[str]
+    sql_query: str
+    index_column: Optional[str]
+    columns: Optional[List[str]]
+    query_template_params: Optional[Dict[str, Any]]
+    level: Optional[int]
+    partition_type: Optional[str]
+    partition_config: Optional[Dict[str, Any]]
+    storage_path: Optional[str]
+    is_materialized: bool
+    materialized_at: Optional[datetime]
+    row_count: Optional[int]
+    column_stats: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FeatureMaterializeResponse(BaseModel):
+    """Schema for feature materialization response."""
+    feature_id: int
+    dagster_run_id: str
+    status: str
+
+
+# ============================================================================
+# Classifier Schemas
+# ============================================================================
+
+class ClassifierConfig(BaseModel):
+    """Classifier training configuration."""
+    threshold_method: str = Field(default="max_confidence", description="'entropy' or 'max_confidence'")
+    threshold_value: float = Field(default=0.7, description="Confidence threshold for filtering")
+    min_labels_per_class: int = Field(default=10, description="Minimum samples per class after filtering")
+    imbalance_factor: float = Field(default=3.0, description="Max ratio of largest to smallest class")
+    test_size: float = Field(default=0.2, description="Test set fraction")
+    random_state: int = Field(default=42, description="Random seed")
+    n_estimators: int = Field(default=100, description="Number of estimators for ensemble models")
+    max_depth: Optional[int] = Field(default=None, description="Max tree depth (None for unlimited)")
+
+
+class ClassifierRunRequest(BaseModel):
+    """Schema for triggering classifier training."""
+    snorkel_job_id: int = Field(..., description="Snorkel job ID whose results to use")
+    feature_ids: List[int] = Field(..., description="Feature IDs to join as training data")
+    config: ClassifierConfig
+
+
+class ClassifierJobResponse(BaseModel):
+    """Schema for classifier job response."""
+    job_id: int
+    c_id: int
+    snorkel_job_id: int
+    feature_ids: List[int]
+    config: Dict[str, Any]
+    dagster_run_id: Optional[str]
+    status: str
+    result_path: Optional[str]
+    error_message: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True

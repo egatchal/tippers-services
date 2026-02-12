@@ -88,8 +88,11 @@ labeling_functions:
 # 1. Each rule/LF entry above can be copied directly as a JSON body in Postman.
 #    Just convert YAML to JSON (keys are the same as the Pydantic schema fields).
 #
-# 2. LFs now return cv_id values (e.g., STATIC=1, LAPTOP=2, PHONE=3) or ABSTAIN=-1.
-#    The Dagster snorkel_training asset remaps cv_ids to 0-indexed class labels.
+# 2. LFs return cv_id values or use symbolic names (STATIC, LAPTOP, PHONE) or ABSTAIN=-1.
+#    The Dagster snorkel_training asset automatically injects the correct cv_id constants
+#    by looking up concept value names in the DB and overriding user-defined values.
+#    This means you can write `PHONE = 3` in your code, but if the actual cv_id for
+#    PHONE is 6, the system will override it to 6 before calling your function.
 #
 # 3. applicable_cv_ids on LFs declares which concept values the LF may vote on.
 #    Snorkel cardinality is determined from the union of all selected LFs' applicable_cv_ids.
@@ -98,10 +101,11 @@ labeling_functions:
 #    applicable_cv_ids and label_guidance have been removed from rules.
 #
 # 5. To use this configuration:
-#    a) Create concept values: STATIC (cv_id=1), LAPTOP (cv_id=2), PHONE (cv_id=3)
+#    a) Create concept values: STATIC, LAPTOP, PHONE (cv_ids are auto-assigned)
 #    b) Create an index that samples mac_addresses from user_location_trajectory
 #    c) Create rules using POST /concepts/{c_id}/rules with the entries above
 #    d) Materialize each rule
 #    e) Create LFs using POST /concepts/{c_id}/labeling-functions with the entries above
+#       (set applicable_cv_ids to the actual cv_ids from step a)
 #    f) Approve each LF via POST /concepts/{c_id}/labeling-functions/{lf_id}/approve
 #    g) Run Snorkel training with selected LFs

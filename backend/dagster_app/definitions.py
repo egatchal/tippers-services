@@ -4,7 +4,9 @@ from backend.dagster_app.resources import database_resource, s3_resource, mlflow
 from backend.dagster_app.jobs import (
     materialize_index_job,
     materialize_rule_job,
-    snorkel_training_pipeline
+    materialize_feature_job,
+    snorkel_training_pipeline,
+    classifier_training_pipeline
 )
 
 # Load all assets
@@ -16,7 +18,9 @@ defs = Definitions(
     jobs=[
         materialize_index_job,
         materialize_rule_job,
-        snorkel_training_pipeline
+        materialize_feature_job,
+        snorkel_training_pipeline,
+        classifier_training_pipeline
     ],
     resources={
         "database_connection": database_resource,

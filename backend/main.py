@@ -8,7 +8,9 @@ from backend.routers import (
     labeling_functions,
     snorkel,
     dagster,
-    database_connections
+    database_connections,
+    features,
+    classifiers
 )
 import logging
 
@@ -50,6 +52,8 @@ app.include_router(indexes.router, prefix="/concepts", tags=["indexes"])
 app.include_router(rules.router, prefix="/concepts", tags=["rules"])
 app.include_router(labeling_functions.router, prefix="/concepts", tags=["labeling_functions"])
 app.include_router(snorkel.router, prefix="/concepts", tags=["snorkel"])
+app.include_router(features.router, prefix="/concepts", tags=["features"])
+app.include_router(classifiers.router, prefix="/concepts", tags=["classifiers"])
 app.include_router(dagster.router, prefix="/dagster", tags=["dagster"])
 
 @app.get("/")

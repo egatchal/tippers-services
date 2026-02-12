@@ -1,0 +1,120 @@
+# Features and Classifiers Configuration
+# Postman-ready JSON bodies for device classification concept
+#
+# Features are simple SQL aggregations used as training inputs for downstream classifiers.
+# Classifiers use Snorkel's probabilistic labels + features to train a bank of models via LazyClassifier.
+#
+# Concept value IDs (create these first):
+#   cv_id=1: STATIC (Intermittent static device)
+#   cv_id=2: LAPTOP (Weekday 9AM-9PM connections)
+#   cv_id=3: PHONE (Short daily sessions)
+
+# ============================================================================
+# Features — POST /concepts/{c_id}/features
+# Simple SQL aggregations, one or a few columns per entity
+# ============================================================================
+
+features:
+  # POST /concepts/{c_id}/features
+  - name: "mean_session_duration"
+    index_id: 1
+    sql_query: "SELECT mac_address, AVG(EXTRACT(EPOCH FROM (end_time - start_time))) AS mean_interval FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address"
+    index_column: "mac_address"
+    columns: ["mean_interval"]
+    description: "Calculates the average session duration in seconds for each MAC address"
+    level: 1
+
+  # POST /concepts/{c_id}/features
+  - name: "total_connections"
+    index_id: 1
+    sql_query: "SELECT mac_address, COUNT(*) AS total_conn FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address"
+    index_column: "mac_address"
+    columns: ["total_conn"]
+    description: "Counts the total number of connections/sessions for each MAC address"
+    level: 1
+
+  # POST /concepts/{c_id}/features
+  - name: "num_days_connected"
+    index_id: 1
+    sql_query: "SELECT mac_address, COUNT(DISTINCT DATE(start_time)) AS num_days FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address"
+    index_column: "mac_address"
+    columns: ["num_days"]
+    description: "Counts the number of unique days each MAC address was connected"
+    level: 1
+
+  # POST /concepts/{c_id}/features
+  - name: "start_end_dates"
+    index_id: 1
+    sql_query: "SELECT mac_address, MIN(start_time) AS start_date, MAX(end_time) AS end_date FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address"
+    index_column: "mac_address"
+    columns: ["start_date", "end_date"]
+    description: "Returns the earliest start time and latest end time for each MAC address"
+
+  # POST /concepts/{c_id}/features
+  - name: "unique_ap"
+    index_id: 1
+    sql_query: "SELECT mac_address, COUNT(DISTINCT sensor_id) AS unique_ap FROM user_ap_trajectory WHERE mac_address IN (:index_values) GROUP BY mac_address"
+    index_column: "mac_address"
+    columns: ["unique_ap"]
+    description: "Counts the number of unique access points/sensors each MAC address has connected to"
+
+
+# ============================================================================
+# Classifier — POST /concepts/{c_id}/classifiers/run
+# Trains a bank of classifiers on Snorkel-labeled data + features
+# ============================================================================
+
+classifiers:
+  # POST /concepts/{c_id}/classifiers/run
+  # Run after: (1) Snorkel job is COMPLETED, (2) all features are materialized
+  - snorkel_job_id: 1
+    feature_ids: [1, 2, 3, 4, 5]
+    config:
+      threshold_method: "max_confidence"
+      threshold_value: 0.7
+      min_labels_per_class: 10
+      imbalance_factor: 3.0
+      test_size: 0.2
+      random_state: 42
+
+
+# Notes:
+# -------------------------
+# 1. Each feature/classifier entry above can be copied directly as a JSON body in Postman.
+#    Just convert YAML to JSON (keys are the same as the Pydantic schema fields).
+#
+# 2. Features use the same :index_values placeholder pattern as rules.
+#    The system extracts unique values from the index's index_column and replaces
+#    :index_values with a formatted SQL IN clause.
+#
+# 3. Features differ from rules:
+#    - Features have `description`, `columns`, and `level` fields
+#    - Features are simpler — typically one SELECT with GROUP BY
+#    - Features are used as classifier training inputs (not LF inputs)
+#
+# 4. Classifier training flow:
+#    a) Create and materialize features using POST /concepts/{c_id}/features
+#    b) Materialize each feature via POST /concepts/{c_id}/features/{feature_id}/materialize
+#    c) Ensure a Snorkel job is COMPLETED
+#    d) Run classifier via POST /concepts/{c_id}/classifiers/run
+#    e) Check results via GET /concepts/{c_id}/classifiers/jobs/{job_id}/results
+#
+# 5. The classifier pipeline:
+#    - Loads Snorkel probabilistic labels
+#    - Filters by confidence threshold (entropy or max_confidence)
+#    - Ensures min_labels_per_class and caps imbalance
+#    - Joins materialized feature data
+#    - Trains 30+ classifiers via LazyClassifier
+#    - Returns ranked model scores (Accuracy, Balanced Accuracy, F1, etc.)
+#
+# 6. Data flow:
+#    Index (mac_addresses)
+#      +-- Rules -> LFs -> Snorkel Training -> Probabilistic Labels
+#      |                                             |
+#      +-- Features (simple SQL aggregations) -------+
+#                                                    v
+#                                           Classifier Training
+#                                           (filter labels, join features, LazyClassifier)
+#                                                    |
+#                                                    v
+#                                           Model Scores (30+ classifiers ranked)

@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@theme {
+  --color-pipeline-index: #3b82f6;
+  --color-pipeline-rule: #8b5cf6;
+  --color-pipeline-feature: #06b6d4;
+  --color-pipeline-lf: #f59e0b;
+  --color-pipeline-snorkel: #10b981;
+  --color-pipeline-classifier: #ec4899;
+}

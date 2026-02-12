@@ -14,6 +14,8 @@ from backend.schemas import (
     SnorkelJobResponse
 )
 from datetime import datetime
+import json
+import os
 
 router = APIRouter()
 
@@ -142,7 +144,7 @@ async def run_snorkel_training(
         run_config=run_config
     )
     
-    job.dagster_run_id = result.run_id
+    job.dagster_run_id = result["run_id"]
     job.status = "RUNNING"
     db.commit()
 
@@ -209,11 +211,15 @@ async def get_snorkel_results(
     db: Session = Depends(get_db)
 ):
     """
-    Get Snorkel training results.
+    Get Snorkel training results including LF summary stats and class distribution.
 
-    Returns predictions in the format specified during training:
-    - **softmax**: Probabilistic predictions with confidence scores
-    - **hard_labels**: Binary label predictions
+    Returns:
+    - **lf_summary**: Per-LF stats (coverage, overlaps, conflicts, polarity, learned_weight)
+    - **label_matrix_class_distribution**: Class counts from raw label matrix majority vote
+    - **model_class_distribution**: Class counts from trained Snorkel LabelModel predictions
+    - **overall_stats**: Aggregate stats (n_samples, n_lfs, cardinality, coverage, overlaps, conflicts)
+    - **predictions**: Probabilities (softmax) or labels (hard_labels) per sample
+    - **cv_id_to_name**: Mapping from concept value ID to name
 
     - **c_id**: Concept ID
     - **job_id**: Job ID
@@ -229,7 +235,7 @@ async def get_snorkel_results(
             detail=f"Snorkel job with ID {job_id} not found for concept {c_id}"
         )
 
-    if job.status != "SUCCESS":
+    if job.status != "COMPLETED":
         return {
             "job_id": job_id,
             "status": job.status,
@@ -242,44 +248,49 @@ async def get_snorkel_results(
             detail="Job completed but results path not found"
         )
 
-    # TODO: Load results from S3
-    # from backend.utils.s3_client import load_results_from_s3
-    # results = load_results_from_s3(job.result_path)
-    #
-    # if job.output_type == 'softmax':
-    #     predictions = [
-    #         {
-    #             "sample_id": idx,
-    #             "probs": probs.tolist(),
-    #             "predicted_class": int(np.argmax(probs)),
-    #             "confidence": float(np.max(probs))
-    #         }
-    #         for idx, probs in enumerate(results['probabilities'])
-    #     ]
-    #
-    #     return {
-    #         "job_id": job_id,
-    #         "output_type": "softmax",
-    #         "predictions": predictions,
-    #         "summary": {
-    #             "total_samples": len(predictions),
-    #             "avg_confidence": float(np.mean([p['confidence'] for p in predictions]))
-    #         }
-    #     }
-    # else:
-    #     return {
-    #         "job_id": job_id,
-    #         "output_type": "hard_labels",
-    #         "predictions": results['labels'].tolist()
-    #     }
+    # Load results JSON from S3 or local storage
+    result_path = job.result_path
 
-    # Placeholder response
+    if result_path.startswith("s3://"):
+        import boto3
+        s3_path_parts = result_path.replace("s3://", "").split("/", 1)
+        s3_bucket = s3_path_parts[0]
+        s3_key = s3_path_parts[1]
+        local_path = f"/tmp/snorkel_result_{job_id}.json"
+
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "minioadmin"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        )
+        s3_client.download_file(s3_bucket, s3_key, local_path)
+        with open(local_path, "r") as f:
+            results = json.load(f)
+    else:
+        if not os.path.exists(result_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Results file not found at {result_path}"
+            )
+        with open(result_path, "r") as f:
+            results = json.load(f)
+
     return {
         "job_id": job_id,
         "status": job.status,
-        "output_type": job.output_type,
-        "result_path": job.result_path,
-        "message": "Results loading not implemented yet. Check result_path in S3."
+        "output_type": results.get("output_type", job.output_type),
+        "lf_summary": results.get("lf_summary", []),
+        "label_matrix_class_distribution": results.get("label_matrix_class_distribution", {}),
+        "model_class_distribution": results.get("model_class_distribution", {}),
+        "overall_stats": results.get("overall_stats", {}),
+        "cv_id_to_name": results.get("cv_id_to_name", {}),
+        "cv_id_to_index": results.get("cv_id_to_index", {}),
+        "predictions": {
+            "probabilities": results.get("probabilities"),
+            "labels": results.get("labels"),
+            "sample_ids": results.get("sample_ids", []),
+        },
     }
 
 

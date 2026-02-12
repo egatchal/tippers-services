@@ -13,8 +13,20 @@ materialize_rule_job = define_asset_job(
     selection=AssetSelection.keys("materialized_rule")
 )
 
-# Full Snorkel training pipeline (all three assets)
+# Job to materialize a single feature (requires index to be materialized first)
+materialize_feature_job = define_asset_job(
+    name="materialize_feature_job",
+    selection=AssetSelection.keys("materialized_feature")
+)
+
+# Snorkel training job (index and rules must already be materialized)
 snorkel_training_pipeline = define_asset_job(
     name="snorkel_training_pipeline",
-    selection=AssetSelection.groups("data_materialization", "feature_engineering", "weak_supervision")
+    selection=AssetSelection.keys("snorkel_training")
+)
+
+# Classifier training pipeline (requires Snorkel job completed + features materialized)
+classifier_training_pipeline = define_asset_job(
+    name="classifier_training_pipeline",
+    selection=AssetSelection.keys("classifier_training")
 )

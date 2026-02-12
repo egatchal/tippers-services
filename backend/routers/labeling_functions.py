@@ -456,6 +456,22 @@ async def update_labeling_function(
                 detail=f"Labeling function with name '{update_data['name']}' already exists for concept {c_id}"
             )
 
+    # Validate applicable_cv_ids if updating
+    if "applicable_cv_ids" in update_data:
+        cv_ids = update_data["applicable_cv_ids"]
+        if cv_ids:
+            found = db.query(ConceptValue.cv_id).filter(
+                ConceptValue.c_id == c_id,
+                ConceptValue.cv_id.in_(cv_ids)
+            ).all()
+            found_ids = {row[0] for row in found}
+            missing = set(cv_ids) - found_ids
+            if missing:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Concept value IDs {sorted(missing)} not found for concept {c_id}"
+                )
+
     # Update fields
     for key, value in update_data.items():
         setattr(lf, key, value)
