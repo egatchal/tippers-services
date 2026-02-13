@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, TIMESTAMP, ARRAY, JSON, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, Text, TIMESTAMP, ARRAY, JSON, Float, ForeignKey, UniqueConstraint
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from backend.db.session import Base
@@ -202,3 +202,69 @@ class ClassifierJob(Base):
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     completed_at = Column(TIMESTAMP, nullable=True)
+
+class HostedModel(Base):
+    """
+    Logical model identity for your app.
+
+    MLflow stores the real model artifacts and versions.
+    This table tracks the model name and minimal metadata you want in Postgres.
+    """
+    __tablename__ = "hosted_models"
+
+    model_id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # For MVP single-tenant you can hardcode owner_id="default" in the API.
+    # If you already have users/auth, set owner_id accordingly.
+    owner_id = Column(String(255), nullable=False, index=True)
+
+    # User-facing name (and typically also the MLflow registered model name)
+    name = Column(String(255), nullable=False)
+
+    description = Column(Text, nullable=True)
+    activity = Column(String(64), nullable=False, server_default="occupancy")  # MVP default
+    visibility = Column(String(32), nullable=False, server_default="private")  # private/public
+    status = Column(String(32), nullable=False, server_default="ACTIVE")       # ACTIVE/ARCHIVED
+
+    # MLflow Registered Model name
+    mlflow_registered_name = Column(String(255), nullable=False, index=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    versions = relationship("HostedModelVersion", back_populates="model", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "name", name="uq_hosted_models_owner_name"),
+    )
+
+
+class HostedModelVersion(Base):
+    """
+    One row per MLflow Model Registry version.
+    """
+    __tablename__ = "hosted_model_versions"
+
+    model_version_id = Column(Integer, primary_key=True, autoincrement=True)
+    model_id = Column(Integer, ForeignKey("hosted_models.model_id", ondelete="CASCADE"), nullable=False)
+
+    # MLflow version number for the registered model
+    mlflow_version = Column(Integer, nullable=False)
+
+    # Where it came from
+    mlflow_run_id = Column(String(255), nullable=True)
+    artifact_uri = Column(String(500), nullable=True)
+
+    # Cached stage (Production/Staging/Archived/None)
+    stage = Column(String(64), nullable=True)
+
+    status = Column(String(32), nullable=False, server_default="REGISTERED")   # REGISTERED/FAILED
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+    model = relationship("HostedModel", back_populates="versions")
+
+    __table_args__ = (
+        UniqueConstraint("model_id", "mlflow_version", name="uq_hosted_model_versions_model_mlflow_version"),
+    )

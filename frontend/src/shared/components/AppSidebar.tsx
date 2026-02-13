@@ -3,7 +3,7 @@ import { NavLink } from 'react-router-dom';
 import { Workflow, Database, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 
 const navItems = [
-  { label: 'Pipeline Builder', path: '/pipeline', icon: Workflow },
+  { label: 'Snorkel Pipeline Builder', path: '/pipeline', icon: Workflow },
   { label: 'Connections', path: '/connections', icon: Database },
 ];
 

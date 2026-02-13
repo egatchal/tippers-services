@@ -10,7 +10,8 @@ from backend.routers import (
     dagster,
     database_connections,
     features,
-    classifiers
+    classifiers,
+    models
 )
 import logging
 
@@ -55,6 +56,7 @@ app.include_router(snorkel.router, prefix="/concepts", tags=["snorkel"])
 app.include_router(features.router, prefix="/concepts", tags=["features"])
 app.include_router(classifiers.router, prefix="/concepts", tags=["classifiers"])
 app.include_router(dagster.router, prefix="/dagster", tags=["dagster"])
+app.include_router(models.router, prefix="/models", tags=["models"])
 
 @app.get("/")
 async def root():

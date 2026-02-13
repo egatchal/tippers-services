@@ -3,7 +3,7 @@ import { RefreshCw } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
 
 const breadcrumbMap: Record<string, string> = {
-  '/pipeline': 'Pipeline Builder',
+  '/pipeline': 'Snorkel Pipeline Builder',
   '/connections': 'Database Connections',
 };
 

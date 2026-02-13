@@ -47,6 +47,7 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
       - PYTHONPATH=/app
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
     ports:
       - "8000:8000"
     volumes:
@@ -111,7 +112,34 @@ services:
         condition: service_healthy
     command: dagster-webserver -h 0.0.0.0 -p 3000 -w /app/backend/dagster_app/workspace.yaml
 
+  mlflow:
+    build:
+      context: ./mlflow
+      dockerfile: Dockerfile
+    container_name: tippers-mlflow
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://postgres:postgres@postgres:5432/tippers
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+      - MLFLOW_HOST=mlflow:5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://postgres:postgres@postgres:5432/tippers
+      --default-artifact-root /mlflow/artifacts
+      --allowed-hosts "mlflow,mlflow:5000,localhost,127.0.0.1"
+
+
 volumes:
   postgres_data:
   redis_data:
   dagster_home:
+  mlflow_artifacts:
+
