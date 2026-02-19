@@ -540,6 +540,181 @@ def materialized_feature(context: AssetExecutionContext) -> Output[Dict[str, Any
         session.close()
 
 
+@asset(
+    group_name="occupancy",
+    description="Computes occupancy bins for a space subtree from WiFi session data",
+    required_resource_keys={"s3_storage"},
+    config_schema={"dataset_id": int}
+)
+def occupancy_dataset(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
+    """
+    Compute space occupancy over time by binning WiFi session data.
+
+    Recursively resolves all spaces under root_space_id, bins time into
+    interval_seconds-wide buckets, and counts distinct MAC addresses per bin
+    per space. Results are stored as Parquet in S3.
+    """
+    dataset_id = context.op_config.get("dataset_id")
+
+    if not dataset_id:
+        raise ValueError("dataset_id must be provided in op_config")
+
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        context.log.info(f"Loading occupancy dataset metadata for dataset_id={dataset_id}")
+
+        row = session.execute(
+            text("SELECT * FROM occupancy_datasets WHERE dataset_id = :id"),
+            {"id": dataset_id}
+        ).fetchone()
+
+        if not row:
+            raise ValueError(f"Occupancy dataset with ID {dataset_id} not found")
+
+        OCCUPANCY_SQL = """
+        WITH RECURSIVE subtree AS (
+            SELECT space_id FROM space WHERE space_id = :root_space_id
+            UNION ALL
+            SELECT s.space_id FROM space s
+            JOIN subtree st ON s.parent_space_id = st.space_id
+        ),
+        bins AS (
+            SELECT generate_series(
+                :chunk_start::timestamp,
+                :chunk_end::timestamp - (:interval_seconds || ' seconds')::interval,
+                (:interval_seconds || ' seconds')::interval
+            ) AS bin_start
+        )
+        SELECT
+            st.space_id,
+            b.bin_start AS interval_begin_time,
+            COUNT(DISTINCT sess.mac_address) AS number_connections
+        FROM subtree st
+        CROSS JOIN bins b
+        LEFT JOIN user_ap_trajectory sess ON
+            sess.space_id = st.space_id
+            AND sess.start_time < b.bin_start + (:interval_seconds || ' seconds')::interval
+            AND sess.end_time > b.bin_start
+        GROUP BY st.space_id, b.bin_start
+        ORDER BY st.space_id, b.bin_start
+        """
+
+        from datetime import timedelta
+
+        chunks = []
+        if row.chunk_days:
+            chunk_delta = timedelta(days=row.chunk_days)
+            t = row.start_time
+            while t < row.end_time:
+                chunks.append((t, min(t + chunk_delta, row.end_time)))
+                t += chunk_delta
+        else:
+            chunks = [(row.start_time, row.end_time)]
+
+        context.log.info(f"Processing {len(chunks)} chunk(s) for dataset_id={dataset_id}")
+
+        dfs = []
+        for i, (chunk_start, chunk_end) in enumerate(chunks):
+            context.log.info(f"Chunk {i+1}/{len(chunks)}: {chunk_start} → {chunk_end}")
+            params = {
+                "root_space_id": row.root_space_id,
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "interval_seconds": row.interval_seconds,
+            }
+            chunk_df = pd.read_sql(text(OCCUPANCY_SQL), engine, params=params)
+            context.log.info(f"  → {len(chunk_df)} rows")
+            dfs.append(chunk_df)
+
+        df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
+            columns=["space_id", "interval_begin_time", "number_connections"]
+        )
+
+        context.log.info(f"Total rows: {len(df)}")
+
+        # Compute column stats
+        column_stats = compute_column_stats(df)
+
+        # Write Parquet locally
+        local_path = f"/tmp/occupancy_{dataset_id}.parquet"
+        df.to_parquet(local_path, index=False)
+
+        # Upload to S3
+        s3_client = context.resources.s3_storage.get_client()
+        s3_bucket = context.resources.s3_storage.bucket_name
+
+        start_iso = row.start_time.strftime("%Y%m%dT%H%M%SZ")
+        end_iso = row.end_time.strftime("%Y%m%dT%H%M%SZ")
+        s3_key = (
+            f"occupancy/root_space_id={row.root_space_id}/"
+            f"interval_seconds={row.interval_seconds}/"
+            f"start={start_iso}_end={end_iso}/data.parquet"
+        )
+
+        try:
+            s3_client.upload_file(local_path, s3_bucket, s3_key)
+            storage_path = f"s3://{s3_bucket}/{s3_key}"
+            context.log.info(f"Uploaded to S3: {storage_path}")
+        except Exception as s3_error:
+            context.log.warning(f"Failed to upload to S3: {s3_error}. Using local path.")
+            storage_path = local_path
+
+        # Update DB record
+        session.execute(
+            text("""
+            UPDATE occupancy_datasets
+            SET status = 'COMPLETED',
+                storage_path = :path,
+                row_count = :rc,
+                column_stats = :cs::jsonb,
+                completed_at = now()
+            WHERE dataset_id = :id
+            """),
+            {
+                "path": storage_path,
+                "rc": len(df),
+                "cs": json.dumps(column_stats),
+                "id": dataset_id,
+            }
+        )
+        session.commit()
+
+        context.log.info(f"Occupancy dataset {dataset_id} computation complete")
+
+        return Output(
+            value={
+                "dataset_id": dataset_id,
+                "row_count": len(df),
+                "storage_path": storage_path,
+            },
+            metadata={
+                "row_count": len(df),
+                "storage_path": storage_path,
+            }
+        )
+
+    except Exception as e:
+        context.log.error(f"Error computing occupancy dataset: {str(e)}")
+
+        session.execute(
+            text("""
+            UPDATE occupancy_datasets
+            SET status = 'FAILED',
+                error_message = :error,
+                completed_at = now()
+            WHERE dataset_id = :id
+            """),
+            {"error": str(e), "id": dataset_id}
+        )
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
 def apply_custom_lf(df: pd.DataFrame, lf_config: dict, valid_cv_ids: set, cv_id_to_index: dict,
                     cv_name_to_id: dict, context) -> np.ndarray:
     """

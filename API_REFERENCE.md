@@ -15,8 +15,9 @@ Complete API reference for all endpoints. Base URL: `http://localhost:8000`
 9. [Asset Catalog](#asset-catalog)
 10. [Snorkel Training](#snorkel-training)
 11. [Classifiers](#classifiers)
-12. [Dagster Integration](#dagster-integration)
-13. [Common Patterns](#common-patterns)
+12. [Occupancy Datasets](#occupancy-datasets)
+13. [Dagster Integration](#dagster-integration)
+14. [Common Patterns](#common-patterns)
 
 ---
 
@@ -1285,6 +1286,150 @@ Can only cancel jobs with status `PENDING` or `RUNNING`.
 
 ---
 
+## Occupancy Datasets
+
+Compute space occupancy over time from WiFi session data. Sessions and space hierarchy are queried directly from the local tippers PostgreSQL database — no external DB connection needed. Results are stored as Parquet in S3.
+
+**How it works:**
+1. Recursively resolves all spaces under `root_space_id` using the `space` table hierarchy
+2. Generates time bins of `interval_seconds` width across `[start_time, end_time)`
+3. Counts distinct `mac_address` values from `user_ap_trajectory` per bin per space
+4. Stores results as Parquet and records stats in the `occupancy_datasets` table
+
+### Create Occupancy Dataset
+```http
+POST /occupancy/datasets
+```
+
+**Request Body:**
+```json
+{
+  "name": "Building_89_Fall_2024",
+  "description": "Hourly occupancy for Building 89 and sub-spaces",
+  "root_space_id": 1234,
+  "start_time": "2024-09-01T00:00:00Z",
+  "end_time": "2024-12-01T00:00:00Z",
+  "interval_seconds": 3600,
+  "chunk_days": 7
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Dataset name |
+| `description` | string | No | Dataset description |
+| `root_space_id` | integer | Yes | Root space ID — occupancy is computed for this space and all descendants |
+| `start_time` | datetime (UTC) | Yes | Start of time window (inclusive) |
+| `end_time` | datetime (UTC) | Yes | End of time window (exclusive) |
+| `interval_seconds` | integer | No | Bin width in seconds (default: `900` = 15 min; minimum: `60`) |
+| `chunk_days` | integer \| null | No | Process N days at a time to limit memory usage (default: `7`; `null` = single query) |
+
+**Validation:**
+- `end_time` must be after `start_time`
+- `interval_seconds` must be ≥ 60
+- Total bins `(end_time - start_time) / interval_seconds` must be ≤ 50,000
+
+**Response (201):**
+```json
+{
+  "dataset_id": 1,
+  "name": "Building_89_Fall_2024",
+  "description": "Hourly occupancy for Building 89 and sub-spaces",
+  "root_space_id": 1234,
+  "start_time": "2024-09-01T00:00:00Z",
+  "end_time": "2024-12-01T00:00:00Z",
+  "interval_seconds": 3600,
+  "chunk_days": 7,
+  "status": "RUNNING",
+  "dagster_run_id": "abc123xyz",
+  "storage_path": null,
+  "row_count": null,
+  "column_stats": null,
+  "error_message": null,
+  "created_at": "2024-01-15T10:00:00Z",
+  "completed_at": null
+}
+```
+
+### List Occupancy Datasets
+```http
+GET /occupancy/datasets?skip=0&limit=100
+```
+
+Returns datasets ordered by `created_at` descending.
+
+**Response (200):** Array of `OccupancyDatasetResponse`.
+
+### Get Occupancy Dataset
+```http
+GET /occupancy/datasets/{dataset_id}
+```
+
+**Response (200):** Single `OccupancyDatasetResponse`.
+
+Status values: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
+
+### Get Occupancy Results
+```http
+GET /occupancy/datasets/{dataset_id}/results
+```
+
+Returns the first 500 rows of the computed occupancy data.
+
+**Response (200) — Job not complete:**
+```json
+{
+  "dataset_id": 1,
+  "status": "RUNNING",
+  "message": "Dataset is RUNNING. Results not available yet."
+}
+```
+
+**Response (200) — Job complete:**
+```json
+{
+  "dataset_id": 1,
+  "status": "COMPLETED",
+  "row_count": 52416,
+  "rows": [
+    {
+      "space_id": 1234,
+      "interval_begin_time": "2024-09-01T00:00:00",
+      "number_connections": 0
+    },
+    {
+      "space_id": 1234,
+      "interval_begin_time": "2024-09-01T01:00:00",
+      "number_connections": 12
+    },
+    {
+      "space_id": 1235,
+      "interval_begin_time": "2024-09-01T00:00:00",
+      "number_connections": 3
+    }
+  ]
+}
+```
+
+Each row contains:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `space_id` | integer | Space ID (root or any descendant) |
+| `interval_begin_time` | timestamp | Start of the time bin (UTC) |
+| `number_connections` | integer | Count of distinct MAC addresses seen in this space during this bin |
+
+### Delete Occupancy Dataset
+```http
+DELETE /occupancy/datasets/{dataset_id}
+```
+
+Deletes the DB record only — does not delete the Parquet file from S3.
+
+**Response:** `204 No Content`
+
+---
+
 ## Dagster Integration
 
 Monitor and manage Dagster job execution. All endpoints are prefixed with `/dagster`.
@@ -1591,6 +1736,20 @@ Index (Sampling)
                                                                          |
                                                                          v
                                                               Model Scores (30+ classifiers ranked)
+
+
+Occupancy (independent of concept pipeline)
+
+  space table (hierarchy) + user_ap_trajectory (sessions)
+          |
+          v
+  Occupancy Dataset Job (Dagster)
+  - Recursive CTE resolves space subtree
+  - generate_series bins time window
+  - COUNT(DISTINCT mac_address) per bin per space
+          |
+          v
+  Parquet in S3  →  GET /occupancy/datasets/{id}/results
 ```
 
 **Index** — Defines which records to work with (e.g., 5000 mac_addresses).

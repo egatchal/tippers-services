@@ -203,6 +203,28 @@ class ClassifierJob(Base):
     created_at = Column(TIMESTAMP, server_default=func.now())
     completed_at = Column(TIMESTAMP, nullable=True)
 
+class OccupancyDataset(Base):
+    """Occupancy datasets table - computes space occupancy over time from WiFi session data."""
+    __tablename__ = "occupancy_datasets"
+
+    dataset_id       = Column(Integer, primary_key=True, autoincrement=True)
+    name             = Column(String(255), nullable=False)
+    description      = Column(Text, nullable=True)
+    root_space_id    = Column(Integer, nullable=False)
+    start_time       = Column(TIMESTAMP, nullable=False)
+    end_time         = Column(TIMESTAMP, nullable=False)
+    interval_seconds = Column(Integer, nullable=False)
+    chunk_days       = Column(Integer, nullable=True)
+    status           = Column(String(50), default='PENDING')
+    dagster_run_id   = Column(String(255), nullable=True)
+    storage_path     = Column(String(500), nullable=True)
+    row_count        = Column(Integer, nullable=True)
+    column_stats     = Column(JSON, nullable=True)
+    error_message    = Column(Text, nullable=True)
+    created_at       = Column(TIMESTAMP, server_default=func.now())
+    completed_at     = Column(TIMESTAMP, nullable=True)
+
+
 class HostedModel(Base):
     """
     Logical model identity for your app.

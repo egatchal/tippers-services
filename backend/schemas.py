@@ -469,3 +469,41 @@ class ClassifierJobResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ============================================================================
+# Occupancy Schemas
+# ============================================================================
+
+class OccupancyDatasetCreate(BaseModel):
+    """Schema for creating an occupancy dataset."""
+    name: str
+    description: Optional[str] = None
+    root_space_id: int
+    start_time: datetime
+    end_time: datetime
+    interval_seconds: int = 900
+    chunk_days: Optional[int] = 7
+
+
+class OccupancyDatasetResponse(BaseModel):
+    """Schema for occupancy dataset response."""
+    dataset_id: int
+    name: str
+    description: Optional[str]
+    root_space_id: int
+    start_time: datetime
+    end_time: datetime
+    interval_seconds: int
+    chunk_days: Optional[int]
+    status: str
+    dagster_run_id: Optional[str]
+    storage_path: Optional[str]
+    row_count: Optional[int]
+    column_stats: Optional[Dict[str, Any]]
+    error_message: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True

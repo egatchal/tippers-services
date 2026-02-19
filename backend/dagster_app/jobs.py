@@ -30,3 +30,9 @@ classifier_training_pipeline = define_asset_job(
     name="classifier_training_pipeline",
     selection=AssetSelection.keys("classifier_training")
 )
+
+# Occupancy dataset computation job
+occupancy_dataset_job = define_asset_job(
+    name="occupancy_dataset_job",
+    selection=AssetSelection.keys("occupancy_dataset")
+)

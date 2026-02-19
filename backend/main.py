@@ -11,7 +11,8 @@ from backend.routers import (
     database_connections,
     features,
     classifiers,
-    models
+    models,
+    occupancy
 )
 import logging
 
@@ -57,6 +58,7 @@ app.include_router(features.router, prefix="/concepts", tags=["features"])
 app.include_router(classifiers.router, prefix="/concepts", tags=["classifiers"])
 app.include_router(dagster.router, prefix="/dagster", tags=["dagster"])
 app.include_router(models.router, prefix="/models", tags=["models"])
+app.include_router(occupancy.router, prefix="/occupancy", tags=["occupancy"])
 
 @app.get("/")
 async def root():

@@ -6,7 +6,8 @@ from backend.dagster_app.jobs import (
     materialize_rule_job,
     materialize_feature_job,
     snorkel_training_pipeline,
-    classifier_training_pipeline
+    classifier_training_pipeline,
+    occupancy_dataset_job
 )
 
 # Load all assets
@@ -20,7 +21,8 @@ defs = Definitions(
         materialize_rule_job,
         materialize_feature_job,
         snorkel_training_pipeline,
-        classifier_training_pipeline
+        classifier_training_pipeline,
+        occupancy_dataset_job
     ],
     resources={
         "database_connection": database_resource,
