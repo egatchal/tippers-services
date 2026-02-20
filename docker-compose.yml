@@ -38,6 +38,7 @@ services:
     container_name: tippers-fastapi
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/tippers
+      - TIPPERS_DB_URL=${TIPPERS_DB_URL}
       - REDIS_URL=redis://redis:6379
       - DAGSTER_HOST=dagster-webserver
       - DAGSTER_PORT=3000
@@ -71,6 +72,7 @@ services:
     container_name: tippers-dagster-daemon
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/tippers
+      - TIPPERS_DB_URL=${TIPPERS_DB_URL}
       - REDIS_URL=redis://redis:6379
       - ENCRYPTION_KEY=sqKEsHs77url0z08dERPLf5rg9f04GG-azUnvF8iFBA=
       - S3_BUCKET_NAME=${S3_BUCKET_NAME}
@@ -79,6 +81,7 @@ services:
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
       - PYTHONPATH=/app
       - DAGSTER_HOME=/app/dagster_home
+      - DAGSTER_MAX_CONCURRENT=${DAGSTER_MAX_CONCURRENT:-8}
     volumes:
       - ./backend:/app/backend
       - dagster_home:/app/dagster_home
@@ -86,6 +89,14 @@ services:
       postgres:
         condition: service_healthy
     command: dagster-daemon run -w /app/backend/dagster_app/workspace.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: '${DAGSTER_CPU_LIMIT:-4.0}'
+          memory: ${DAGSTER_MEMORY_LIMIT:-8G}
+        reservations:
+          cpus: '1.0'
+          memory: 2G
 
   dagster-webserver:
     build:
@@ -94,6 +105,7 @@ services:
     container_name: tippers-dagster-webserver
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/tippers
+      - TIPPERS_DB_URL=${TIPPERS_DB_URL}
       - REDIS_URL=redis://redis:6379
       - ENCRYPTION_KEY=sqKEsHs77url0z08dERPLf5rg9f04GG-azUnvF8iFBA=
       - S3_BUCKET_NAME=${S3_BUCKET_NAME}
@@ -102,6 +114,7 @@ services:
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
       - PYTHONPATH=/app
       - DAGSTER_HOME=/app/dagster_home
+      - DAGSTER_MAX_CONCURRENT=${DAGSTER_MAX_CONCURRENT:-8}
     ports:
       - "3000:3000"
     volumes:
@@ -111,6 +124,14 @@ services:
       postgres:
         condition: service_healthy
     command: dagster-webserver -h 0.0.0.0 -p 3000 -w /app/backend/dagster_app/workspace.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   mlflow:
     build:

@@ -472,17 +472,48 @@ class ClassifierJobResponse(BaseModel):
 
 
 # ============================================================================
+# Space Schemas
+# ============================================================================
+
+class SpaceResponse(BaseModel):
+    """Schema for a space record from the tippers DB."""
+    space_id: int
+    space_name: Optional[str]
+    parent_space_id: Optional[int]
+    building_room: Optional[str]
+
+
+# ============================================================================
 # Occupancy Schemas
 # ============================================================================
+
+class OccupancySpaceChunkResponse(BaseModel):
+    """Schema for a per-space per-chunk materialization record."""
+    chunk_id: int
+    space_id: int
+    interval_seconds: int
+    chunk_start: datetime
+    chunk_end: datetime
+    space_type: str
+    status: str
+    storage_path: Optional[str]
+    dagster_run_id: Optional[str]
+    error_message: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
 
 class OccupancyDatasetCreate(BaseModel):
     """Schema for creating an occupancy dataset."""
     name: str
     description: Optional[str] = None
     root_space_id: int
-    start_time: datetime
-    end_time: datetime
-    interval_seconds: int = 900
+    start_time: Optional[datetime] = None   # None → auto-resolve from data
+    end_time: Optional[datetime] = None     # None → auto-resolve from data
+    interval_seconds: int = 3600            # Must be in ALLOWED_INTERVALS
     chunk_days: Optional[int] = 7
 
 

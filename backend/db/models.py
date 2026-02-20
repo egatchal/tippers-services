@@ -225,6 +225,36 @@ class OccupancyDataset(Base):
     completed_at     = Column(TIMESTAMP, nullable=True)
 
 
+class OccupancySpaceChunk(Base):
+    """Per-space per-time-chunk record for occupancy computation.
+
+    Chunks are epoch-aligned windows keyed by (space_id, interval_seconds,
+    chunk_start, chunk_end). Source chunks are computed from raw session data;
+    derived chunks are computed by summing children bottom-up.
+    """
+    __tablename__ = "occupancy_space_chunks"
+
+    chunk_id         = Column(Integer, primary_key=True, autoincrement=True)
+    space_id         = Column(Integer, nullable=False)
+    interval_seconds = Column(Integer, nullable=False)
+    chunk_start      = Column(TIMESTAMP, nullable=False)
+    chunk_end        = Column(TIMESTAMP, nullable=False)
+    space_type       = Column(String(16), nullable=False)   # 'source' or 'derived'
+    status           = Column(String(16), default="PENDING", nullable=False)
+    storage_path     = Column(String(500), nullable=True)
+    dagster_run_id   = Column(String(255), nullable=True)
+    error_message    = Column(Text, nullable=True)
+    created_at       = Column(TIMESTAMP, server_default=func.now())
+    completed_at     = Column(TIMESTAMP, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'space_id', 'interval_seconds', 'chunk_start', 'chunk_end',
+            name='uq_occupancy_space_chunk'
+        ),
+    )
+
+
 class HostedModel(Base):
     """
     Logical model identity for your app.

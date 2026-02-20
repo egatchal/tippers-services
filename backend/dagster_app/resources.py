@@ -35,7 +35,8 @@ class S3Resource(ConfigurableResource):
             's3',
             aws_access_key_id=self.aws_access_key_id,
             aws_secret_access_key=self.aws_secret_access_key,
-            region_name=self.aws_region
+            region_name=self.aws_region,
+            endpoint_url=os.getenv("S3_ENDPOINT_URL"),
         )
 
 class MLflowResource(ConfigurableResource):

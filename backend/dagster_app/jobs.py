@@ -1,5 +1,12 @@
 """Dagster job definitions for weak supervision pipeline."""
-from dagster import define_asset_job, AssetSelection
+import os
+from dagster import define_asset_job, AssetSelection, multiprocess_executor
+from backend.dagster_app.assets import (
+    occupancy_dataset_graph,
+    source_chunk_graph,
+    derived_chunk_graph,
+)
+from backend.dagster_app.resources import s3_resource
 
 # Job to materialize a single index
 materialize_index_job = define_asset_job(
@@ -31,8 +38,22 @@ classifier_training_pipeline = define_asset_job(
     selection=AssetSelection.keys("classifier_training")
 )
 
-# Occupancy dataset computation job
-occupancy_dataset_job = define_asset_job(
+# Occupancy dataset computation job (graph-based with DynamicOutput fan-out)
+occupancy_dataset_job = occupancy_dataset_graph.to_job(
     name="occupancy_dataset_job",
-    selection=AssetSelection.keys("occupancy_dataset")
+    resource_defs={"s3_storage": s3_resource},
+    executor_def=multiprocess_executor.configured({
+        "max_concurrent": int(os.getenv("DAGSTER_MAX_CONCURRENT", "8"))
+    }),
+)
+
+# Per-space-chunk jobs (one Dagster run per chunk; config_schema carries chunk_id)
+materialize_source_chunk_job = source_chunk_graph.to_job(
+    name="materialize_source_chunk_job",
+    resource_defs={"s3_storage": s3_resource},
+)
+
+materialize_derived_chunk_job = derived_chunk_graph.to_job(
+    name="materialize_derived_chunk_job",
+    resource_defs={"s3_storage": s3_resource},
 )

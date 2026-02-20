@@ -16,8 +16,10 @@ Complete API reference for all endpoints. Base URL: `http://localhost:8000`
 10. [Snorkel Training](#snorkel-training)
 11. [Classifiers](#classifiers)
 12. [Occupancy Datasets](#occupancy-datasets)
-13. [Dagster Integration](#dagster-integration)
-14. [Common Patterns](#common-patterns)
+13. [Spaces](#spaces)
+14. [Dagster Integration](#dagster-integration)
+15. [Common Patterns](#common-patterns)
+16. [Applying Code Changes](#applying-code-changes)
 
 ---
 
@@ -1288,13 +1290,31 @@ Can only cancel jobs with status `PENDING` or `RUNNING`.
 
 ## Occupancy Datasets
 
-Compute space occupancy over time from WiFi session data. Sessions and space hierarchy are queried directly from the local tippers PostgreSQL database — no external DB connection needed. Results are stored as Parquet in S3.
+Compute space occupancy over time from WiFi session data using **bottom-up per-space chunk materialization**. Sessions and space hierarchy are read from the tippers PostgreSQL database (`TIPPERS_DB_URL`). Results are stored as Parquet files in S3, one per space per time chunk.
 
 **How it works:**
-1. Recursively resolves all spaces under `root_space_id` using the `space` table hierarchy
-2. Generates time bins of `interval_seconds` width across `[start_time, end_time)`
-3. Counts distinct `mac_address` values from `user_ap_trajectory` per bin per space
-4. Stores results as Parquet and records stats in the `occupancy_datasets` table
+
+`POST /occupancy/datasets` returns immediately. Computation proceeds asynchronously in three phases:
+
+1. **Space discovery** _(synchronous, in the request)_ — Walks the space subtree via recursive CTE. Identifies **source spaces** (rooms whose `space_id` appears in `user_ap_trajectory` within the time range) and **derived spaces** (their ancestors in the hierarchy: floors, buildings). Computes epoch-aligned chunk windows of `chunk_days` days.
+
+2. **Source chunk jobs** _(parallel Dagster runs)_ — One `materialize_source_chunk_job` run per `(source_space_id, chunk_window)`. Each run executes SQL against tippers to count `DISTINCT mac_address` per interval bin and uploads a sparse Parquet to:
+   ```
+   s3://bucket/occupancy/spaces/{space_id}/{interval_seconds}/chunk_{start}_{end}.parquet
+   ```
+   Columns: `interval_begin_time`, `number_connections`. Empty bins are not stored.
+
+3. **Derived chunk jobs** _(triggered by sensor)_ — The `occupancy_space_chunk_sensor` polls every 30 seconds. When all children of a derived space have COMPLETED chunks for a window, it submits `materialize_derived_chunk_job`, which sums child parquets by `interval_begin_time`. Floors complete before buildings (bottom-up).
+
+**Chunk reuse:** Chunks are keyed by `(space_id, interval_seconds, chunk_start, chunk_end)`. A COMPLETED chunk is never re-run — `POST /occupancy/datasets` with a wider time range only triggers the new, uncovered windows.
+
+**Extension example:**
+
+| Request | New chunks computed | Reused |
+|---|---|---|
+| Oct–Dec 2024 | Oct, Nov, Dec (all spaces) | — |
+| Oct–Mar 2025 | Jan, Feb, Mar (all spaces) | Oct, Nov, Dec |
+| Nov 2024 only | — | Nov (already COMPLETED) |
 
 ### Create Occupancy Dataset
 ```http
@@ -1310,7 +1330,7 @@ POST /occupancy/datasets
   "start_time": "2024-09-01T00:00:00Z",
   "end_time": "2024-12-01T00:00:00Z",
   "interval_seconds": 3600,
-  "chunk_days": 7
+  "chunk_days": 30
 }
 ```
 
@@ -1318,16 +1338,16 @@ POST /occupancy/datasets
 |-------|------|----------|-------------|
 | `name` | string | Yes | Dataset name |
 | `description` | string | No | Dataset description |
-| `root_space_id` | integer | Yes | Root space ID — occupancy is computed for this space and all descendants |
-| `start_time` | datetime (UTC) | Yes | Start of time window (inclusive) |
-| `end_time` | datetime (UTC) | Yes | End of time window (exclusive) |
-| `interval_seconds` | integer | No | Bin width in seconds (default: `900` = 15 min; minimum: `60`) |
-| `chunk_days` | integer \| null | No | Process N days at a time to limit memory usage (default: `7`; `null` = single query) |
+| `root_space_id` | integer | Yes | Root space — occupancy is computed for this space and all descendants |
+| `start_time` | datetime (UTC) | No | Start of time window (inclusive). Auto-detected as `MIN(start_time)` if omitted |
+| `end_time` | datetime (UTC) | No | End of time window (exclusive). Auto-detected as `MAX(end_time)` if omitted |
+| `interval_seconds` | integer | No | Bin width in seconds (default: `3600`). Must be one of: `900`, `1800`, `3600`, `7200`, `14400`, `28800`, `86400` |
+| `chunk_days` | integer | No | Calendar-aligned chunk window width (default: `30`). Determines the reuse boundary — two datasets with the same `chunk_days` share identical chunk windows |
 
 **Validation:**
 - `end_time` must be after `start_time`
-- `interval_seconds` must be ≥ 60
-- Total bins `(end_time - start_time) / interval_seconds` must be ≤ 50,000
+- `interval_seconds` must be one of the 7 allowed values
+- If no session data exists for the space subtree, returns immediately with `status: "COMPLETED"` and `row_count: 0`
 
 **Response (201):**
 ```json
@@ -1339,9 +1359,9 @@ POST /occupancy/datasets
   "start_time": "2024-09-01T00:00:00Z",
   "end_time": "2024-12-01T00:00:00Z",
   "interval_seconds": 3600,
-  "chunk_days": 7,
+  "chunk_days": 30,
   "status": "RUNNING",
-  "dagster_run_id": "abc123xyz",
+  "dagster_run_id": null,
   "storage_path": null,
   "row_count": null,
   "column_stats": null,
@@ -1350,6 +1370,8 @@ POST /occupancy/datasets
   "completed_at": null
 }
 ```
+
+`dagster_run_id` is `null` because the new system submits many Dagster runs (one per source chunk), not a single run.
 
 ### List Occupancy Datasets
 ```http
@@ -1371,41 +1393,55 @@ Status values: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
 
 ### Get Occupancy Results
 ```http
-GET /occupancy/datasets/{dataset_id}/results
+GET /occupancy/datasets/{dataset_id}/results?space_id={space_id}
 ```
 
-Returns the first 500 rows of the computed occupancy data.
+Returns occupancy data for one space within the dataset. Use `space_id` to drill into a specific room, floor, or building. Defaults to `root_space_id`.
 
-**Response (200) — Job not complete:**
+| Query Parameter | Type | Default | Description |
+|-----------------|------|---------|-------------|
+| `space_id` | integer | `root_space_id` | The space to retrieve data for (must be within the dataset's subtree) |
+
+**Response (200) — In progress:**
 ```json
 {
   "dataset_id": 1,
+  "space_id": 1234,
   "status": "RUNNING",
-  "message": "Dataset is RUNNING. Results not available yet."
+  "completed_chunks": 2,
+  "total_chunks": 4
 }
 ```
 
-**Response (200) — Job complete:**
+**Response (200) — One or more chunks failed:**
 ```json
 {
   "dataset_id": 1,
+  "space_id": 1234,
+  "status": "FAILED",
+  "error": "Source chunk SQL failed: relation 'user_ap_trajectory' does not exist",
+  "completed_chunks": 3,
+  "total_chunks": 4
+}
+```
+
+**Response (200) — All chunks complete:**
+```json
+{
+  "dataset_id": 1,
+  "space_id": 1234,
   "status": "COMPLETED",
-  "row_count": 52416,
+  "completed_chunks": 4,
+  "total_chunks": 4,
+  "row_count": 500,
   "rows": [
     {
-      "space_id": 1234,
       "interval_begin_time": "2024-09-01T00:00:00",
-      "number_connections": 0
-    },
-    {
-      "space_id": 1234,
-      "interval_begin_time": "2024-09-01T01:00:00",
       "number_connections": 12
     },
     {
-      "space_id": 1235,
-      "interval_begin_time": "2024-09-01T00:00:00",
-      "number_connections": 3
+      "interval_begin_time": "2024-09-01T01:00:00",
+      "number_connections": 31
     }
   ]
 }
@@ -1415,18 +1451,126 @@ Each row contains:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `space_id` | integer | Space ID (root or any descendant) |
 | `interval_begin_time` | timestamp | Start of the time bin (UTC) |
-| `number_connections` | integer | Count of distinct MAC addresses seen in this space during this bin |
+| `number_connections` | integer | Distinct MAC addresses seen in this space during this bin |
+
+Rows are sorted by `interval_begin_time` and capped at 500. Empty bins are not returned (sparse). When querying a derived space (floor/building), `number_connections` is the sum over all descendant source spaces.
 
 ### Delete Occupancy Dataset
 ```http
 DELETE /occupancy/datasets/{dataset_id}
 ```
 
-Deletes the DB record only — does not delete the Parquet file from S3.
+Deletes the `OccupancyDataset` DB record only. Does not delete `OccupancySpaceChunk` records or S3 parquet files — chunks remain available for reuse by other datasets.
 
 **Response:** `204 No Content`
+
+---
+
+## Spaces
+
+Read-only access to the `space` table on the external tippers DB (`TIPPERS_DB_URL`). Use these endpoints to browse the space hierarchy and look up valid `root_space_id` values before creating an occupancy dataset.
+
+**Space response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `space_id` | integer | Unique space identifier |
+| `space_name` | string \| null | Human-readable name |
+| `parent_space_id` | integer \| null | Parent space ID (`null` for root spaces) |
+| `building_room` | string \| null | Building/room identifier |
+
+### List Spaces
+```http
+GET /spaces?search=Engineering&skip=0&limit=100
+```
+
+| Query Parameter | Type | Default | Description |
+|-----------------|------|---------|-------------|
+| `search` | string | — | Case-insensitive substring match on `space_name` |
+| `skip` | integer | 0 | Pagination offset |
+| `limit` | integer | 100 | Max results |
+
+**Response (200):**
+```json
+[
+  {
+    "space_id": 1234,
+    "space_name": "Engineering Hall",
+    "parent_space_id": 100,
+    "building_room": "EH"
+  },
+  {
+    "space_id": 1235,
+    "space_name": "Engineering Hall - Room 101",
+    "parent_space_id": 1234,
+    "building_room": "EH-101"
+  }
+]
+```
+
+Returns `[]` if no spaces match.
+
+### Get Space
+```http
+GET /spaces/{space_id}
+```
+
+**Response (200):** Single space object.
+
+**Response (404):** Space not found.
+
+### Get Space Children
+```http
+GET /spaces/{space_id}/children
+```
+
+Returns only the **direct children** of the given space (one level deep).
+
+**Response (200):**
+```json
+[
+  {
+    "space_id": 1235,
+    "space_name": "Engineering Hall - Room 101",
+    "parent_space_id": 1234,
+    "building_room": "EH-101"
+  }
+]
+```
+
+### Get Space Subtree
+```http
+GET /spaces/{space_id}/subtree
+```
+
+Returns the root space **and all descendants** at any depth, via recursive CTE.
+
+**Response (200):**
+```json
+[
+  {
+    "space_id": 1234,
+    "space_name": "Engineering Hall",
+    "parent_space_id": 100,
+    "building_room": "EH"
+  },
+  {
+    "space_id": 1235,
+    "space_name": "Engineering Hall - Room 101",
+    "parent_space_id": 1234,
+    "building_room": "EH-101"
+  },
+  {
+    "space_id": 1236,
+    "space_name": "Engineering Hall - Room 102",
+    "parent_space_id": 1234,
+    "building_room": "EH-102"
+  }
+]
+```
+
+Results are ordered by `space_name`.
 
 ---
 
@@ -1740,16 +1884,30 @@ Index (Sampling)
 
 Occupancy (independent of concept pipeline)
 
-  space table (hierarchy) + user_ap_trajectory (sessions)
+  POST /occupancy/datasets
           |
-          v
-  Occupancy Dataset Job (Dagster)
-  - Recursive CTE resolves space subtree
-  - generate_series bins time window
-  - COUNT(DISTINCT mac_address) per bin per space
+          ├─ query tippers: space subtree + parent-child map
+          ├─ find source spaces (rooms with WiFi data)
+          ├─ find derived spaces (ancestors of source spaces)
+          ├─ compute epoch-aligned chunk windows (chunk_days)
+          └─ upsert OccupancySpaceChunk records (ON CONFLICT DO NOTHING for COMPLETED)
+                    |
+                    ├── materialize_source_chunk_job  (one run per source space chunk)
+                    │       space_id=room, interval=3600, chunk_start=..., chunk_end=...
+                    │       → SQL bins DISTINCT mac_address per interval in tippers
+                    │       → uploads sparse parquet to:
+                    │         s3://bucket/occupancy/spaces/{space_id}/{interval}/chunk_{start}_{end}.parquet
+                    │
+                    └── occupancy_space_chunk_sensor  (polls every 30 s)
+                            when all children of a derived space are COMPLETED:
+                            → materialize_derived_chunk_job  (sum children's parquets)
+                            → floor before building (natural bottom-up order)
+
+  GET /occupancy/datasets/{id}/results?space_id=X
           |
-          v
-  Parquet in S3  →  GET /occupancy/datasets/{id}/results
+          ├─ load OccupancySpaceChunk records for (space_id, interval, chunk windows)
+          ├─ if any PENDING/RUNNING → return {"status": "RUNNING", "completed_chunks": N, "total_chunks": M}
+          └─ if all COMPLETED → download parquets from S3, concat, return rows
 ```
 
 **Index** — Defines which records to work with (e.g., 5000 mac_addresses).
@@ -1785,3 +1943,39 @@ Once the server is running:
 
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+---
+
+## Applying Code Changes
+
+### Docker (normal workflow)
+
+After editing Python files (routers, schemas, assets), restart the affected services:
+
+```bash
+docker-compose restart fastapi dagster-webserver dagster-daemon
+```
+
+If you added a new file or changed `requirements.txt`, rebuild first:
+
+```bash
+docker-compose up -d --build fastapi dagster-webserver dagster-daemon
+```
+
+Full restart (e.g. after a DB schema change):
+
+```bash
+docker-compose down && docker-compose up -d
+```
+
+> New DB tables are created automatically on startup via `create_all()` — no migration needed unless you are altering an existing table.
+
+### Local development (without Docker)
+
+```bash
+# Terminal 1 — FastAPI with auto-reload (no manual restart needed)
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+
+# Terminal 2 — Dagster (also hot-reloads in dev mode)
+dagster dev -w backend/dagster_app/workspace.yaml
+```

@@ -181,6 +181,25 @@ def _run_migrations(engine):
             END IF;
         END $$;
         """,
+        # Create occupancy_space_chunks table (idempotent)
+        """
+        CREATE TABLE IF NOT EXISTS occupancy_space_chunks (
+            chunk_id         SERIAL PRIMARY KEY,
+            space_id         INTEGER NOT NULL,
+            interval_seconds INTEGER NOT NULL,
+            chunk_start      TIMESTAMP NOT NULL,
+            chunk_end        TIMESTAMP NOT NULL,
+            space_type       VARCHAR(16) NOT NULL,
+            status           VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+            storage_path     VARCHAR(500),
+            dagster_run_id   VARCHAR(255),
+            error_message    TEXT,
+            created_at       TIMESTAMP DEFAULT NOW(),
+            completed_at     TIMESTAMP,
+            CONSTRAINT uq_occupancy_space_chunk
+                UNIQUE (space_id, interval_seconds, chunk_start, chunk_end)
+        )
+        """,
     ]
 
     try:
