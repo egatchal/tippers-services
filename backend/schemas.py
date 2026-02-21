@@ -537,3 +537,65 @@ class OccupancyDatasetResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Occupancy Model Training
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OccupancyTrainRequest(BaseModel):
+    """Request to train an occupancy model."""
+    dataset_id: int
+    space_id: int  # Which space to train model for
+    model_type: str  # 'prophet' or 'transformer'
+    config: Optional[Dict[str, Any]] = None  # Hyperparameter overrides
+
+
+class OccupancyTrainResponse(BaseModel):
+    """Response after creating a training job."""
+    job_id: int
+    dataset_id: int
+    space_id: int
+    model_type: str
+    status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OccupancyModelJobResponse(BaseModel):
+    """Full training job status response."""
+    job_id: int
+    dataset_id: int
+    space_id: int
+    model_type: str
+    config: Optional[Dict[str, Any]]
+    mlflow_run_id: Optional[str]
+    mlflow_model_name: Optional[str]
+    mlflow_model_version: Optional[int]
+    dagster_run_id: Optional[str]
+    status: str
+    metrics: Optional[Dict[str, Any]]
+    error_message: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class OccupancyModelSummary(BaseModel):
+    """Summary of a trained model for a space."""
+    job_id: int
+    model_type: str
+    mlflow_model_name: Optional[str]
+    mlflow_model_version: Optional[int]
+    metrics: Optional[Dict[str, Any]]
+    created_at: datetime
+
+
+class SpaceModelsResponse(BaseModel):
+    """All trained models for a specific space."""
+    space_id: int
+    models: Dict[str, Optional[OccupancyModelSummary]]  # {'prophet': ..., 'transformer': ...}

@@ -5,8 +5,16 @@ from sqlalchemy import create_engine, text as sa_text
 from typing import List, Optional
 from datetime import datetime, timedelta
 from backend.db.session import get_db
-from backend.db.models import OccupancyDataset, OccupancySpaceChunk
-from backend.schemas import OccupancyDatasetCreate, OccupancyDatasetResponse
+from backend.db.models import OccupancyDataset, OccupancySpaceChunk, OccupancyModelJob
+from backend.schemas import (
+    OccupancyDatasetCreate,
+    OccupancyDatasetResponse,
+    OccupancyTrainRequest,
+    OccupancyTrainResponse,
+    OccupancyModelJobResponse,
+    SpaceModelsResponse,
+    OccupancyModelSummary,
+)
 from backend.utils.timeout_calculator import get_timeout_calculator
 import os
 
@@ -448,3 +456,203 @@ async def delete_occupancy_dataset(
 
     db.delete(dataset)
     db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Training Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLOWED_MODEL_TYPES = {"prophet", "transformer"}
+
+
+@router.post("/train", response_model=OccupancyTrainResponse, status_code=status.HTTP_201_CREATED)
+async def train_occupancy_model(
+    request: OccupancyTrainRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Trigger training job for occupancy model.
+
+    Creates an OccupancyModelJob record and submits a Dagster job.
+    Returns job_id for polling status.
+    """
+    # Validate model type
+    if request.model_type not in ALLOWED_MODEL_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"model_type must be one of: {sorted(ALLOWED_MODEL_TYPES)}"
+        )
+
+    # Validate dataset exists
+    dataset = db.query(OccupancyDataset).filter(
+        OccupancyDataset.dataset_id == request.dataset_id
+    ).first()
+
+    if not dataset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Dataset {request.dataset_id} not found"
+        )
+
+    # Check dataset is ready (has completed chunks)
+    from sqlalchemy import func
+    chunk = db.query(OccupancySpaceChunk).filter(
+        OccupancySpaceChunk.space_id == request.space_id,
+        OccupancySpaceChunk.interval_seconds == dataset.interval_seconds,
+        OccupancySpaceChunk.status == 'COMPLETED',
+        func.date(OccupancySpaceChunk.chunk_start) <= func.date(dataset.start_time),
+        func.date(OccupancySpaceChunk.chunk_end) >= func.date(dataset.end_time),
+    ).first()
+
+    if not chunk:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No completed data chunk found for space_id={request.space_id}. "
+                   f"Ensure the dataset is fully processed."
+        )
+
+    # Create job record
+    job = OccupancyModelJob(
+        dataset_id=request.dataset_id,
+        space_id=request.space_id,
+        model_type=request.model_type,
+        config=request.config,
+        status="PENDING",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # Submit Dagster job
+    from backend.utils.dagster_client import get_dagster_client
+    dagster_client = get_dagster_client()
+
+    run_config = {
+        "ops": {
+            "train_occupancy_model_op": {
+                "config": {"job_id": job.job_id}
+            }
+        }
+    }
+
+    try:
+        result = dagster_client.submit_job_execution(
+            job_name="train_occupancy_model_job",
+            run_config=run_config,
+        )
+        job.dagster_run_id = result.get("run_id")
+        db.commit()
+    except Exception as e:
+        job.status = "FAILED"
+        job.error_message = f"Failed to submit Dagster job: {str(e)}"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to submit training job: {str(e)}"
+        )
+
+    return job
+
+
+@router.get("/train/{job_id}", response_model=OccupancyModelJobResponse)
+async def get_training_status(
+    job_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get training job status and metrics."""
+    job = db.query(OccupancyModelJob).filter(
+        OccupancyModelJob.job_id == job_id
+    ).first()
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Training job {job_id} not found"
+        )
+
+    return job
+
+
+@router.get("/models")
+async def list_occupancy_models(
+    space_id: Optional[int] = None,
+    model_type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    List trained occupancy models.
+
+    Filter by space_id and/or model_type.
+    Returns latest version for each (space_id, model_type) combination.
+    """
+    query = db.query(OccupancyModelJob).filter(
+        OccupancyModelJob.status == 'COMPLETED'
+    )
+
+    if space_id is not None:
+        query = query.filter(OccupancyModelJob.space_id == space_id)
+
+    if model_type is not None:
+        if model_type not in ALLOWED_MODEL_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"model_type must be one of: {sorted(ALLOWED_MODEL_TYPES)}"
+            )
+        query = query.filter(OccupancyModelJob.model_type == model_type)
+
+    # Get all completed jobs, ordered by created_at desc
+    jobs = query.order_by(OccupancyModelJob.created_at.desc()).all()
+
+    # Group by (space_id, model_type) and return latest for each
+    seen = set()
+    results = []
+    for job in jobs:
+        key = (job.space_id, job.model_type)
+        if key not in seen:
+            seen.add(key)
+            results.append({
+                "job_id": job.job_id,
+                "space_id": job.space_id,
+                "model_type": job.model_type,
+                "mlflow_model_name": job.mlflow_model_name,
+                "mlflow_model_version": job.mlflow_model_version,
+                "metrics": job.metrics,
+                "created_at": job.created_at,
+            })
+
+    return results
+
+
+@router.get("/models/{space_id}", response_model=SpaceModelsResponse)
+async def get_models_for_space(
+    space_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Get all trained models for a specific space.
+
+    Returns both Prophet and Transformer if available.
+    """
+    # Get latest completed job for each model type
+    models_dict = {}
+
+    for model_type in ALLOWED_MODEL_TYPES:
+        job = db.query(OccupancyModelJob).filter(
+            OccupancyModelJob.space_id == space_id,
+            OccupancyModelJob.model_type == model_type,
+            OccupancyModelJob.status == 'COMPLETED'
+        ).order_by(OccupancyModelJob.created_at.desc()).first()
+
+        if job:
+            models_dict[model_type] = OccupancyModelSummary(
+                job_id=job.job_id,
+                model_type=job.model_type,
+                mlflow_model_name=job.mlflow_model_name,
+                mlflow_model_version=job.mlflow_model_version,
+                metrics=job.metrics,
+                created_at=job.created_at,
+            )
+        else:
+            models_dict[model_type] = None
+
+    return SpaceModelsResponse(space_id=space_id, models=models_dict)

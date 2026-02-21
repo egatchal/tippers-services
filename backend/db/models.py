@@ -257,6 +257,35 @@ class OccupancySpaceChunk(Base):
     )
 
 
+class OccupancyModelJob(Base):
+    """Occupancy model training jobs - trains Prophet or Transformer models."""
+    __tablename__ = "occupancy_model_jobs"
+
+    job_id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_id = Column(Integer, ForeignKey('occupancy_datasets.dataset_id'), nullable=False)
+    space_id = Column(Integer, nullable=False)
+    model_type = Column(String(50), nullable=False)  # 'prophet' or 'transformer'
+
+    # Hyperparameters (defaults from notebooks, user can override)
+    config = Column(JSON, nullable=True)
+
+    # MLflow integration
+    mlflow_run_id = Column(String(255), nullable=True)
+    mlflow_model_name = Column(String(255), nullable=True)
+    mlflow_model_version = Column(Integer, nullable=True)
+
+    # Job tracking
+    dagster_run_id = Column(String(255), nullable=True)
+    status = Column(String(50), default='PENDING')  # PENDING/RUNNING/COMPLETED/FAILED
+
+    # Metrics (logged after training)
+    metrics = Column(JSON, nullable=True)  # {"rmse": 1.23, "mae": 0.98, ...}
+
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    completed_at = Column(TIMESTAMP, nullable=True)
+
+
 class HostedModel(Base):
     """
     Logical model identity for your app.

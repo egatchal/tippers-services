@@ -89,6 +89,7 @@ services:
       - CHUNK_TIMEOUT_MIN_SECONDS=${CHUNK_TIMEOUT_MIN_SECONDS:-7200}
       - CHUNK_TIMEOUT_LOOKBACK_DAYS=${CHUNK_TIMEOUT_LOOKBACK_DAYS:-30}
       - TIMEOUT_SENSOR_INTERVAL_SECONDS=${TIMEOUT_SENSOR_INTERVAL_SECONDS:-60}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
     volumes:
       - ./backend:/app/backend
       - ./dagster_home:/app/dagster_home
@@ -104,6 +105,10 @@ services:
         reservations:
           cpus: '2.0'
           memory: 4G
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   dagster-webserver:
     build:

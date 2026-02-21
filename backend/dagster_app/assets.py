@@ -1,7 +1,7 @@
 """Dagster assets for weak supervision pipeline."""
 from dagster import (
     asset, AssetExecutionContext, Output,
-    op, OpExecutionContext,
+    op, OpExecutionContext, job,
     DynamicOutput, DynamicOut,
     graph,
     run_failure_sensor, RunFailureSensorContext,
@@ -18,6 +18,7 @@ from typing import Dict, Any
 import json
 from cryptography.fernet import Fernet
 from jinja2 import Template
+import boto3
 
 
 def compute_column_stats(df: pd.DataFrame) -> dict:
@@ -2665,3 +2666,201 @@ def dataset_initialization_sensor(context: SensorEvaluationContext):
         context.log.error(f"dataset_initialization_sensor error: {e}")
     finally:
         session.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Occupancy Model Training
+# ─────────────────────────────────────────────────────────────────────────────
+
+@op(config_schema={"job_id": int})
+def train_occupancy_model_op(context):
+    """
+    Train an occupancy model (Prophet or Transformer) and register to MLflow.
+
+    1. Load OccupancyModelJob from DB
+    2. Download parquet from S3 (via chunk storage_path)
+    3. Preprocess data
+    4. Train model
+    5. Log metrics to MLflow
+    6. Register model to MLflow
+    7. Update job record
+    """
+    import mlflow
+    from datetime import datetime
+    from backend.db.models import OccupancyModelJob, OccupancyDataset, OccupancySpaceChunk
+    from backend.models.occupancy_prophet import (
+        prepare_data_from_parquet as prepare_prophet_data,
+        train_prophet_model,
+        PROPHET_DEFAULTS,
+    )
+    from backend.models.occupancy_transformer import (
+        prepare_data_from_parquet as prepare_transformer_data,
+        train_transformer_model,
+        TRANSFORMER_DEFAULTS,
+    )
+
+    job_id = context.op_config["job_id"]
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        # Load job
+        job = session.query(OccupancyModelJob).filter(
+            OccupancyModelJob.job_id == job_id
+        ).first()
+
+        if not job:
+            raise ValueError(f"OccupancyModelJob {job_id} not found")
+
+        # Mark as RUNNING
+        job.status = "RUNNING"
+        session.commit()
+
+        context.log.info(f"Starting training job {job_id}: {job.model_type} for space {job.space_id}")
+
+        # Load dataset
+        dataset = session.query(OccupancyDataset).filter(
+            OccupancyDataset.dataset_id == job.dataset_id
+        ).first()
+
+        if not dataset:
+            raise ValueError(f"Dataset {job.dataset_id} not found")
+
+        # Find chunk for this space
+        from sqlalchemy import func
+        chunk = session.query(OccupancySpaceChunk).filter(
+            OccupancySpaceChunk.space_id == job.space_id,
+            OccupancySpaceChunk.interval_seconds == dataset.interval_seconds,
+            OccupancySpaceChunk.status == 'COMPLETED',
+            func.date(OccupancySpaceChunk.chunk_start) <= func.date(dataset.start_time),
+            func.date(OccupancySpaceChunk.chunk_end) >= func.date(dataset.end_time),
+        ).first()
+
+        if not chunk or not chunk.storage_path:
+            raise ValueError(f"No completed chunk found for space {job.space_id}")
+
+        # Download parquet from S3
+        context.log.info(f"Downloading data from {chunk.storage_path}")
+
+        s3_bucket = os.getenv("S3_BUCKET_NAME", "tippers-data")
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "minioadmin"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        )
+
+        if chunk.storage_path.startswith("s3://"):
+            parts = chunk.storage_path.replace("s3://", "").split("/", 1)
+            local_path = f"/tmp/train_data_job_{job_id}.parquet"
+            s3_client.download_file(parts[0], parts[1], local_path)
+        else:
+            local_path = chunk.storage_path
+
+        df = pd.read_parquet(local_path)
+        context.log.info(f"Loaded {len(df)} rows for training")
+
+        # Get config (merge with defaults)
+        user_config = job.config or {}
+
+        # Setup MLflow
+        tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment("occupancy_models")
+
+        model_name = f"occupancy_{job.model_type}_space_{job.space_id}"
+
+        with mlflow.start_run() as run:
+            # Log parameters
+            mlflow.log_param("space_id", job.space_id)
+            mlflow.log_param("dataset_id", job.dataset_id)
+            mlflow.log_param("model_type", job.model_type)
+            mlflow.log_param("interval_seconds", dataset.interval_seconds)
+
+            if job.model_type == "prophet":
+                # Prepare data for Prophet
+                prepared_df = prepare_prophet_data(df, dataset.interval_seconds)
+                config = {**PROPHET_DEFAULTS, **user_config}
+
+                # Log config
+                for k, v in config.items():
+                    mlflow.log_param(k, v)
+
+                # Train
+                context.log.info("Training Prophet model...")
+                model, scaler, metrics = train_prophet_model(prepared_df, config)
+
+                # Log model
+                mlflow.prophet.log_model(model, "model")
+
+            elif job.model_type == "transformer":
+                # Prepare data for Transformer
+                prepared_df = prepare_transformer_data(df, dataset.interval_seconds)
+                config = {**TRANSFORMER_DEFAULTS, **user_config}
+
+                # Log config
+                for k, v in config.items():
+                    mlflow.log_param(k, v)
+
+                # Train
+                context.log.info("Training Transformer model...")
+                model, scaler, metrics = train_transformer_model(
+                    prepared_df, config, interval_seconds=dataset.interval_seconds
+                )
+
+                # Log model
+                mlflow.pytorch.log_model(model, "model")
+
+            else:
+                raise ValueError(f"Unknown model_type: {job.model_type}")
+
+            # Log metrics (separate numeric from non-numeric)
+            numeric_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+            string_metrics = {k: v for k, v in metrics.items() if not isinstance(v, (int, float))}
+
+            mlflow.log_metrics(numeric_metrics)
+            for k, v in string_metrics.items():
+                mlflow.log_param(f"metric_{k}", v)  # Log strings as params
+
+            context.log.info(f"Training complete. Metrics: {metrics}")
+
+            # Register model
+            model_uri = f"runs:/{run.info.run_id}/model"
+            mv = mlflow.register_model(model_uri, model_name)
+
+            # Update job record
+            job.mlflow_run_id = run.info.run_id
+            job.mlflow_model_name = model_name
+            job.mlflow_model_version = int(mv.version)
+            job.metrics = metrics
+            job.status = "COMPLETED"
+            job.completed_at = datetime.utcnow()
+            session.commit()
+
+            context.log.info(
+                f"Model registered: {model_name} v{mv.version} "
+                f"(RMSE: {metrics.get('rmse', 'N/A'):.4f})"
+            )
+
+    except Exception as e:
+        context.log.error(f"Training job {job_id} failed: {e}")
+        import traceback
+        context.log.error(traceback.format_exc())
+
+        # Mark as failed
+        if job:
+            job.status = "FAILED"
+            job.error_message = str(e)
+            session.commit()
+
+        raise
+
+    finally:
+        session.close()
+
+
+@job
+def train_occupancy_model_job():
+    """Dagster job for training occupancy models."""
+    train_occupancy_model_op()
