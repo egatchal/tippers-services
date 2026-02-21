@@ -14,10 +14,12 @@ tippers-services/
 │   │   ├── rules.py            # Rule CRUD and materialization
 │   │   ├── labeling_functions.py  # LF creation endpoints
 │   │   ├── snorkel.py          # Snorkel training endpoints
+│   │   ├── occupancy.py        # Occupancy dataset endpoints
 │   │   └── dagster.py          # Dagster status endpoints
 │   ├── utils/
 │   │   ├── dagster_client.py   # GraphQL client for Dagster
-│   │   └── validators.py       # SQL and Python validation
+│   │   ├── validators.py       # SQL and Python validation
+│   │   └── timeout_calculator.py  # Dynamic timeout calculation
 │   ├── db/
 │   │   ├── session.py          # Database session management
 │   │   └── models.py           # SQLAlchemy models
@@ -26,14 +28,13 @@ tippers-services/
 │       ├── workspace.yaml      # Dagster workspace config
 │       ├── resources.py        # Dagster resources (DB, S3, MLflow)
 │       ├── jobs.py             # Dagster job definitions
-│       └── assets/
-│           ├── indexes.py      # Index materialization assets
-│           ├── rules.py        # Rule materialization assets
-│           └── snorkel.py      # Snorkel training assets
+│       └── assets.py           # Dagster assets and sensors
+├── dagster_home/
+│   └── dagster.yaml            # Dagster instance configuration
 ├── docker-compose.yml          # Multi-service Docker setup
 ├── Dockerfile                  # Backend service Docker image
 ├── requirements.txt            # Python dependencies
-├── .env.example                # Environment variable template
+├── .env                        # Environment variables (not in git)
 └── README.md                   # This file
 ```
 
@@ -56,11 +57,26 @@ cp .env.example .env
 Edit `.env` with your configuration:
 
 ```env
+# Database Configuration
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/tippers
+TIPPERS_DB_URL=postgresql://user:pass@tippers-db:5432/tippers
+
 # AWS credentials for S3 storage
 S3_BUCKET_NAME=your-bucket-name
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 AWS_DEFAULT_REGION=us-east-1
+
+# Dagster Configuration
+DAGSTER_HOST=dagster-webserver
+DAGSTER_PORT=3000
+DAGSTER_MAX_CONCURRENT=16  # Max concurrent workers per job
+
+# Occupancy Sensor Configuration
+SOURCE_CHUNK_SENSOR_INTERVAL=30  # Sensor runs every 30 seconds
+CHUNK_TIMEOUT_MULTIPLIER=2.0
+CHUNK_TIMEOUT_MIN_SECONDS=300
+CHUNK_TIMEOUT_LOOKBACK_DAYS=30
 ```
 
 ### 3. Start Services
@@ -204,7 +220,7 @@ Interactive docs are available at `http://localhost:8000/docs` once the backend 
 
 ### Occupancy Datasets
 
-Compute WiFi-session-based occupancy counts over a space subtree using **bottom-up per-space chunk materialization**. Each `POST` immediately returns; computation is split into one Dagster run per source space per time chunk, with derived spaces (floors, buildings) triggered automatically once their children complete. Completed chunks are stored at a fixed S3 key and reused across datasets — extending a time range only computes the new chunks.
+Compute WiFi-session-based occupancy counts over a space subtree using **bottom-up per-space chunk materialization**. The API returns **instantly** (<1 second); computation is handled asynchronously by background sensors. Jobs are split into one Dagster run per source space per time chunk, with derived spaces (floors, buildings) triggered automatically once their children complete. Completed chunks are stored at a fixed S3 key and reused across datasets — extending a time range only computes the new chunks.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -297,6 +313,45 @@ dagster dev -w backend/dagster_app/workspace.yaml
 
 ---
 
+## Configuration
+
+### Dagster Concurrent Run Limits
+
+The system uses Dagster's `QueuedRunCoordinator` to manage concurrent job execution. By default, up to **16 concurrent runs** can execute simultaneously.
+
+**To adjust the concurrent run limit:**
+
+1. Edit `dagster_home/dagster.yaml`:
+
+```yaml
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 16  # Change this value
+```
+
+2. Restart Dagster services:
+
+```bash
+docker-compose restart dagster-daemon dagster-webserver
+```
+
+**How it works:**
+
+- The `source_chunk_submission_sensor` submits jobs every 30 seconds (configurable via `SOURCE_CHUNK_SENSOR_INTERVAL`)
+- Dagster's run coordinator queues submitted jobs and launches up to `max_concurrent_runs` simultaneously
+- Each job can spawn multiple worker processes (controlled by `DAGSTER_MAX_CONCURRENT`)
+- Total parallelism = `max_concurrent_runs` × `DAGSTER_MAX_CONCURRENT` workers
+
+**Performance considerations:**
+
+- Higher `max_concurrent_runs` = more parallel jobs but higher memory/CPU usage
+- Monitor system resources and database connection pool limits
+- The default connection pool size is 50 connections (see `backend/db/session.py`)
+
+---
+
 ## Development
 
 ### Local Development Setup
@@ -359,10 +414,11 @@ alembic upgrade head
 
 **Occupancy pipeline (independent of concept pipeline):**
 
-1. `POST /occupancy/datasets` walks the space subtree from tippers DB, finds source spaces (rooms with WiFi data), and creates one `OccupancySpaceChunk` record per (space, epoch-aligned chunk window) combination
-2. A **Dagster job** (`materialize_source_chunk_job`) runs for each source chunk in parallel, writing sparse parquet to `occupancy/spaces/{space_id}/{interval}/{chunk_start}_{chunk_end}.parquet`
-3. A **Dagster sensor** (`occupancy_space_chunk_sensor`) watches for completed source chunks and triggers derived chunk jobs (floors → buildings) bottom-up
-4. `GET /results?space_id=X` polls chunk status and streams concatenated parquet rows once all chunks complete
+1. `POST /occupancy/datasets` **returns instantly** (<1 second) after creating dataset and chunk records. It walks the space subtree from tippers DB, finds source spaces (rooms with WiFi data), and creates one `OccupancySpaceChunk` record per (space, epoch-aligned chunk window) combination
+2. A **background sensor** (`source_chunk_submission_sensor`) runs every 30 seconds, finds PENDING source chunks with no dagster_run_id, and submits up to 100 jobs per iteration
+3. **Dagster jobs** (`materialize_source_chunk_job`) run in parallel (up to 16 concurrent runs by default), each writing sparse parquet to `occupancy/spaces/{space_id}/{interval}/{chunk_start}_{chunk_end}.parquet`
+4. A **Dagster sensor** (`occupancy_space_chunk_sensor`) watches for completed source chunks and triggers derived chunk jobs (floors → buildings) bottom-up
+5. `GET /results?space_id=X` polls chunk status and streams concatenated parquet rows once all chunks complete
 
 ### Key Design Decisions
 

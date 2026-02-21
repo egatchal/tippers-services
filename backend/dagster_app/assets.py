@@ -2122,20 +2122,40 @@ def occupancy_space_chunk_sensor(context: SensorEvaluationContext):
     """
     Triggers derived chunk jobs when all their children's source chunks are COMPLETED.
     Uses run_key per chunk_id so Dagster deduplicates submissions automatically.
+    Processes chunks in batches to avoid timeout.
+    Includes memory-based backpressure.
     """
+    from backend.utils.backpressure import should_submit_jobs, get_memory_usage_percent
+    from backend.utils.timeout_calculator import get_timeout_calculator
+
+    # Backpressure: skip submission if memory > 80%
+    if not should_submit_jobs(threshold_percent=80.0):
+        usage = get_memory_usage_percent()
+        context.log.warning(f"Backpressure active: memory at {usage:.1f}%, skipping derived chunk submission")
+        return
+
+    BATCH_SIZE = 50  # Process max 50 chunks per sensor tick to avoid timeout
+
     engine = get_db_engine()
     tippers_engine = get_tippers_engine()
     Session = sessionmaker(bind=engine)
     session = Session()
+    timeout_calc = get_timeout_calculator()
+
+    # Use cursor to track last processed chunk_id
+    cursor = context.cursor or "0"
+    last_chunk_id = int(cursor)
 
     try:
         pending_derived = session.execute(
             text("""
-            SELECT chunk_id, space_id, interval_seconds, chunk_start, chunk_end
+            SELECT chunk_id, space_id, interval_seconds, chunk_start, chunk_end, retry_count
             FROM occupancy_space_chunks
-            WHERE space_type = 'derived' AND status = 'PENDING'
-            ORDER BY chunk_start
-            """)
+            WHERE space_type = 'derived' AND status = 'PENDING' AND chunk_id > :last_id
+            ORDER BY chunk_id
+            LIMIT :batch_size
+            """),
+            {"last_id": last_chunk_id, "batch_size": BATCH_SIZE}
         ).fetchall()
 
         for chunk in pending_derived:
@@ -2175,8 +2195,29 @@ def occupancy_space_chunk_sensor(context: SensorEvaluationContext):
             if not all_ready:
                 continue
 
+            # Calculate timeout for derived chunk before yielding RunRequest
+            timeout_seconds = timeout_calc.calculate_timeout(
+                session=session,
+                interval_seconds=chunk.interval_seconds,
+                space_type='derived'
+            )
+
+            # Store timeout before job submission
+            session.execute(
+                text("""
+                    UPDATE occupancy_space_chunks
+                    SET timeout_seconds = :timeout
+                    WHERE chunk_id = :chunk_id
+                """),
+                {"timeout": timeout_seconds, "chunk_id": chunk.chunk_id}
+            )
+            session.commit()
+
+            # Include retry_count in run_key so retries get submitted
+            run_key = f"derived_chunk_{chunk.chunk_id}_r{chunk.retry_count}"
+
             yield RunRequest(
-                run_key=f"derived_chunk_{chunk.chunk_id}",
+                run_key=run_key,
                 job_name="materialize_derived_chunk_job",
                 run_config={
                     "ops": {
@@ -2184,10 +2225,443 @@ def occupancy_space_chunk_sensor(context: SensorEvaluationContext):
                             "config": {"chunk_id": chunk.chunk_id}
                         }
                     }
-                }
+                },
+                tags={
+                    "chunk_id": str(chunk.chunk_id),
+                    "space_id": str(chunk.space_id),
+                    "chunk_type": "derived",
+                    "interval_seconds": str(chunk.interval_seconds),
+                },
             )
+
+        # Update cursor: if we processed a full batch, continue from last chunk_id
+        # If batch was smaller, reset to 0 to scan from beginning next tick
+        if pending_derived:
+            max_chunk_id = max(c.chunk_id for c in pending_derived)
+            if len(pending_derived) == BATCH_SIZE:
+                context.update_cursor(str(max_chunk_id))
+            else:
+                # Processed all remaining, reset cursor to start fresh next tick
+                context.update_cursor("0")
 
     except Exception as e:
         context.log.error(f"occupancy_space_chunk_sensor error: {e}")
+    finally:
+        session.close()
+
+
+@sensor(
+    minimum_interval_seconds=int(os.getenv("TIMEOUT_SENSOR_INTERVAL_SECONDS", "60")),
+    name="occupancy_chunk_timeout_sensor"
+)
+def occupancy_chunk_timeout_sensor(context: SensorEvaluationContext):
+    """
+    Monitor RUNNING chunks for timeouts and handle retries.
+
+    For each timed-out chunk:
+    - First timeout (retry_count=0): Terminate run, reset to PENDING, increment retry_count
+      (source_chunk_submission_sensor will pick it up for retry)
+    - Second timeout (retry_count=1): Terminate run, mark FAILED with timeout error
+
+    Uses context.instance for run termination (no webserver dependency).
+    """
+    from dagster import DagsterRunStatus, RunsFilter
+
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        # Find RUNNING chunks where NOW() - created_at > timeout_seconds
+        running_chunks = session.execute(
+            text("""
+                SELECT
+                    chunk_id, space_id, interval_seconds, chunk_start, chunk_end,
+                    space_type, retry_count, timeout_seconds,
+                    created_at,
+                    EXTRACT(EPOCH FROM (NOW() - created_at)) as elapsed_seconds
+                FROM occupancy_space_chunks
+                WHERE status = 'RUNNING'
+                  AND timeout_seconds IS NOT NULL
+                  AND EXTRACT(EPOCH FROM (NOW() - created_at)) > timeout_seconds
+            """)
+        ).fetchall()
+
+        for chunk in running_chunks:
+            chunk_id = chunk.chunk_id
+            retry_count = chunk.retry_count
+            space_type = chunk.space_type
+
+            context.log.warning(
+                f"Chunk {chunk_id} ({space_type}) timed out after {chunk.elapsed_seconds:.0f}s "
+                f"(limit: {chunk.timeout_seconds}s, retry_count: {retry_count})"
+            )
+
+            # Try to terminate any running Dagster runs for this chunk using tag lookup
+            try:
+                runs = context.instance.get_runs(
+                    filters=RunsFilter(
+                        tags={"chunk_id": str(chunk_id)},
+                        statuses=[DagsterRunStatus.STARTED, DagsterRunStatus.STARTING]
+                    ),
+                    limit=1
+                )
+                if runs:
+                    run_id = runs[0].run_id
+                    context.instance.run_launcher.terminate(run_id)
+                    context.log.info(f"Terminated run {run_id} for chunk {chunk_id}")
+            except Exception as e:
+                context.log.warning(f"Failed to terminate run for chunk {chunk_id}: {e}")
+
+            if retry_count == 0:
+                # First timeout - reset to PENDING for retry by submission sensor
+                context.log.info(f"Resetting chunk {chunk_id} to PENDING for retry")
+
+                session.execute(
+                    text("""
+                        UPDATE occupancy_space_chunks
+                        SET status = 'PENDING',
+                            error_message = NULL,
+                            completed_at = NULL,
+                            retry_count = :new_retry_count
+                        WHERE chunk_id = :chunk_id
+                    """),
+                    {"chunk_id": chunk_id, "new_retry_count": retry_count + 1}
+                )
+                session.commit()
+                # Submission sensor will pick this up with new run_key suffix
+
+            else:
+                # retry_count >= 1 - second timeout, mark FAILED
+                context.log.error(
+                    f"Chunk {chunk_id} exceeded timeout after retry, marking FAILED"
+                )
+
+                session.execute(
+                    text("""
+                        UPDATE occupancy_space_chunks
+                        SET status = 'FAILED',
+                            error_message = :error,
+                            completed_at = NOW()
+                        WHERE chunk_id = :chunk_id
+                    """),
+                    {
+                        "chunk_id": chunk_id,
+                        "error": f"Exceeded timeout ({chunk.timeout_seconds}s) after retry. Elapsed: {chunk.elapsed_seconds:.0f}s"
+                    }
+                )
+                session.commit()
+
+    except Exception as e:
+        context.log.error(f"occupancy_chunk_timeout_sensor error: {e}")
+    finally:
+        session.close()
+
+
+@sensor(
+    minimum_interval_seconds=int(os.getenv("SOURCE_CHUNK_SENSOR_INTERVAL", "30")),
+    name="source_chunk_submission_sensor",
+    job_name="materialize_source_chunk_job"
+)
+def source_chunk_submission_sensor(context: SensorEvaluationContext):
+    """
+    Submits Dagster jobs for PENDING source chunks.
+    Uses RunRequest for webserver-independent submission.
+    Includes memory-based backpressure and tag-based concurrency control.
+    """
+    from backend.utils.backpressure import should_submit_jobs, get_memory_usage_percent
+    from backend.utils.timeout_calculator import get_timeout_calculator
+
+    # Backpressure: skip submission if memory > 80%
+    if not should_submit_jobs(threshold_percent=80.0):
+        usage = get_memory_usage_percent()
+        context.log.warning(f"Backpressure active: memory at {usage:.1f}%, skipping submission")
+        return
+
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    timeout_calc = get_timeout_calculator()
+
+    BATCH_SIZE = 100
+
+    try:
+        # Find PENDING source chunks (use run_key for deduplication, not dagster_run_id)
+        pending_chunks = session.execute(
+            text("""
+                SELECT chunk_id, space_id, interval_seconds, retry_count
+                FROM occupancy_space_chunks
+                WHERE space_type = 'source'
+                  AND status = 'PENDING'
+                ORDER BY created_at ASC
+                LIMIT :batch_size
+            """),
+            {"batch_size": BATCH_SIZE}
+        ).fetchall()
+
+        if not pending_chunks:
+            return  # No chunks to submit
+
+        context.log.info(f"Found {len(pending_chunks)} pending source chunks to submit")
+
+        # Group chunks by interval_seconds to calculate timeout once per interval
+        chunks_by_interval = {}
+        for chunk in pending_chunks:
+            interval = chunk.interval_seconds
+            if interval not in chunks_by_interval:
+                chunks_by_interval[interval] = []
+            chunks_by_interval[interval].append((chunk.chunk_id, chunk.space_id, chunk.retry_count))
+
+        for interval_seconds, chunk_data in chunks_by_interval.items():
+            # Calculate timeout for this interval
+            timeout_seconds = timeout_calc.calculate_timeout(
+                session=session,
+                interval_seconds=interval_seconds,
+                space_type='source'
+            )
+
+            for chunk_id, space_id, retry_count in chunk_data:
+                # Store timeout before yielding (we won't have run_id)
+                session.execute(
+                    text("""
+                        UPDATE occupancy_space_chunks
+                        SET timeout_seconds = :timeout
+                        WHERE chunk_id = :chunk_id
+                    """),
+                    {"timeout": timeout_seconds, "chunk_id": chunk_id}
+                )
+
+                run_config = {
+                    "ops": {
+                        "materialize_source_chunk": {
+                            "config": {"chunk_id": chunk_id}
+                        }
+                    }
+                }
+
+                # Include retry_count in run_key so retries get submitted
+                run_key = f"source_chunk_{chunk_id}_r{retry_count}"
+
+                # Yield RunRequest - Dagster handles submission without webserver
+                yield RunRequest(
+                    run_key=run_key,
+                    job_name="materialize_source_chunk_job",
+                    run_config=run_config,
+                    tags={
+                        "chunk_id": str(chunk_id),
+                        "space_id": str(space_id),
+                        "chunk_type": "source",
+                        "interval_seconds": str(interval_seconds),
+                    },
+                )
+
+        session.commit()
+        context.log.info(f"Yielded {len(pending_chunks)} source chunk RunRequests")
+
+    except Exception as e:
+        context.log.error(f"source_chunk_submission_sensor error: {e}")
+    finally:
+        session.close()
+
+
+@sensor(
+    minimum_interval_seconds=10,
+    name="dataset_initialization_sensor"
+)
+def dataset_initialization_sensor(context: SensorEvaluationContext):
+    """
+    Background sensor that initializes datasets by creating their chunk records.
+    Runs every 10 seconds, finds datasets with status='INITIALIZING', creates chunks, marks as 'RUNNING'.
+    """
+    engine = get_db_engine()
+    tippers_engine = get_tippers_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        # Find datasets waiting to be initialized
+        datasets = session.execute(
+            text("SELECT * FROM occupancy_datasets WHERE status = 'INITIALIZING'")
+        ).fetchall()
+
+        for dataset in datasets:
+            try:
+                context.log.info(f"Initializing dataset {dataset.dataset_id}: {dataset.name}")
+
+                # Query space hierarchy
+                with tippers_engine.connect() as tconn:
+                    subtree_rows = tconn.execute(text("""
+                        WITH RECURSIVE subtree AS (
+                            SELECT space_id, parent_space_id FROM space WHERE space_id = :root
+                            UNION ALL
+                            SELECT s.space_id, s.parent_space_id FROM space s
+                            JOIN subtree st ON s.parent_space_id = st.space_id
+                        )
+                        SELECT space_id, parent_space_id FROM subtree
+                    """), {"root": dataset.root_space_id}).fetchall()
+
+                all_space_ids = [r.space_id for r in subtree_rows]
+                parent_map = {r.space_id: r.parent_space_id for r in subtree_rows}
+
+                # Query date range per space (min/max dates with data)
+                with tippers_engine.connect() as tconn:
+                    source_date_ranges = tconn.execute(text("""
+                        SELECT
+                            space_id,
+                            MIN(date_trunc('day', start_time))::date as min_date,
+                            (MAX(date_trunc('day', end_time))::date + 1) as max_date
+                        FROM user_ap_trajectory
+                        WHERE space_id = ANY(:space_ids)
+                          AND start_time < :end_time
+                          AND end_time > :start_time
+                        GROUP BY space_id
+                    """), {
+                        "space_ids": all_space_ids,
+                        "start_time": dataset.start_time,
+                        "end_time": dataset.end_time,
+                    }).fetchall()
+
+                # Build map: {space_id: (min_date, max_date)}
+                source_space_ranges = {}
+                for row in source_date_ranges:
+                    source_space_ranges[row.space_id] = (row.min_date, row.max_date)
+
+                source_spaces = set(source_space_ranges.keys())
+
+                if not source_spaces:
+                    # No data - mark as COMPLETED
+                    session.execute(
+                        text("UPDATE occupancy_datasets SET status = 'COMPLETED', row_count = 0 WHERE dataset_id = :id"),
+                        {"id": dataset.dataset_id}
+                    )
+                    session.commit()
+                    continue
+
+                # Find derived spaces
+                derived_spaces = set()
+                for space_id in source_spaces:
+                    current = space_id
+                    while True:
+                        parent = parent_map.get(current)
+                        if parent is None or parent not in set(all_space_ids):
+                            break
+                        derived_spaces.add(parent)
+                        current = parent
+
+                # Create source chunks (1 per space covering full date range)
+                source_chunk_values = []
+                for space_id, (min_date, max_date) in source_space_ranges.items():
+                    chunk_start = datetime.combine(min_date, datetime.min.time())
+                    chunk_end = datetime.combine(max_date, datetime.min.time())
+                    source_chunk_values.append({
+                        "space_id": space_id,
+                        "interval": dataset.interval_seconds,
+                        "chunk_start": chunk_start,
+                        "chunk_end": chunk_end,
+                    })
+
+                if source_chunk_values:
+                    session.execute(text("""
+                        INSERT INTO occupancy_space_chunks
+                            (space_id, interval_seconds, chunk_start, chunk_end, space_type, status)
+                        SELECT
+                            unnest(CAST(:space_ids AS int[])),
+                            unnest(CAST(:intervals AS int[])),
+                            unnest(CAST(:chunk_starts AS timestamp[])),
+                            unnest(CAST(:chunk_ends AS timestamp[])),
+                            'source',
+                            'PENDING'
+                        ON CONFLICT (space_id, interval_seconds, chunk_start, chunk_end) DO NOTHING
+                    """), {
+                        "space_ids": [v["space_id"] for v in source_chunk_values],
+                        "intervals": [v["interval"] for v in source_chunk_values],
+                        "chunk_starts": [v["chunk_start"] for v in source_chunk_values],
+                        "chunk_ends": [v["chunk_end"] for v in source_chunk_values],
+                    })
+
+                # Create derived chunks (1 per space covering union of children's date ranges)
+                depth_map = {}
+                for space_id in set(all_space_ids):
+                    depth = 0
+                    current = space_id
+                    while parent_map.get(current) is not None:
+                        depth += 1
+                        current = parent_map[current]
+                    depth_map[space_id] = depth
+
+                derived_spaces_sorted = sorted(derived_spaces, key=lambda s: depth_map[s], reverse=True)
+                derived_space_ranges = {}
+                derived_chunk_values = []
+
+                for space_id in derived_spaces_sorted:
+                    children = [sid for sid, parent in parent_map.items() if parent == space_id]
+                    child_min_dates = []
+                    child_max_dates = []
+                    for child_id in children:
+                        if child_id in source_space_ranges:
+                            min_d, max_d = source_space_ranges[child_id]
+                            child_min_dates.append(min_d)
+                            child_max_dates.append(max_d)
+                        elif child_id in derived_space_ranges:
+                            min_d, max_d = derived_space_ranges[child_id]
+                            child_min_dates.append(min_d)
+                            child_max_dates.append(max_d)
+
+                    if not child_min_dates:
+                        continue
+
+                    # Union of children's date ranges
+                    min_date = min(child_min_dates)
+                    max_date = max(child_max_dates)
+                    derived_space_ranges[space_id] = (min_date, max_date)
+
+                    chunk_start = datetime.combine(min_date, datetime.min.time())
+                    chunk_end = datetime.combine(max_date, datetime.min.time())
+                    derived_chunk_values.append({
+                        "space_id": space_id,
+                        "interval": dataset.interval_seconds,
+                        "chunk_start": chunk_start,
+                        "chunk_end": chunk_end,
+                    })
+
+                if derived_chunk_values:
+                    session.execute(text("""
+                        INSERT INTO occupancy_space_chunks
+                            (space_id, interval_seconds, chunk_start, chunk_end, space_type, status)
+                        SELECT
+                            unnest(CAST(:space_ids AS int[])),
+                            unnest(CAST(:intervals AS int[])),
+                            unnest(CAST(:chunk_starts AS timestamp[])),
+                            unnest(CAST(:chunk_ends AS timestamp[])),
+                            'derived',
+                            'PENDING'
+                        ON CONFLICT (space_id, interval_seconds, chunk_start, chunk_end) DO NOTHING
+                    """), {
+                        "space_ids": [v["space_id"] for v in derived_chunk_values],
+                        "intervals": [v["interval"] for v in derived_chunk_values],
+                        "chunk_starts": [v["chunk_start"] for v in derived_chunk_values],
+                        "chunk_ends": [v["chunk_end"] for v in derived_chunk_values],
+                    })
+
+                # Mark dataset as RUNNING (chunks created, ready for job submission)
+                session.execute(
+                    text("UPDATE occupancy_datasets SET status = 'RUNNING' WHERE dataset_id = :id"),
+                    {"id": dataset.dataset_id}
+                )
+                session.commit()
+                context.log.info(f"Dataset {dataset.dataset_id} initialized - {len(source_chunk_values)} source + {len(derived_chunk_values)} derived chunks created")
+
+            except Exception as e:
+                context.log.error(f"Failed to initialize dataset {dataset.dataset_id}: {e}")
+                session.rollback()
+                # Mark as FAILED
+                session.execute(
+                    text("UPDATE occupancy_datasets SET status = 'FAILED', error_message = :err WHERE dataset_id = :id"),
+                    {"err": str(e), "id": dataset.dataset_id}
+                )
+                session.commit()
+
+    except Exception as e:
+        context.log.error(f"dataset_initialization_sensor error: {e}")
     finally:
         session.close()

@@ -514,7 +514,7 @@ class OccupancyDatasetCreate(BaseModel):
     start_time: Optional[datetime] = None   # None → auto-resolve from data
     end_time: Optional[datetime] = None     # None → auto-resolve from data
     interval_seconds: int = 3600            # Must be in ALLOWED_INTERVALS
-    chunk_days: Optional[int] = 7
+    # chunk_days removed - always use 1-day chunks
 
 
 class OccupancyDatasetResponse(BaseModel):
@@ -526,7 +526,6 @@ class OccupancyDatasetResponse(BaseModel):
     start_time: datetime
     end_time: datetime
     interval_seconds: int
-    chunk_days: Optional[int]
     status: str
     dagster_run_id: Optional[str]
     storage_path: Optional[str]

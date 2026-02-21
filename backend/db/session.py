@@ -15,8 +15,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localho
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20
+    pool_size=20,
+    max_overflow=30,
+    pool_recycle=3600
 )
 
 # Create session factory
@@ -199,6 +200,32 @@ def _run_migrations(engine):
             CONSTRAINT uq_occupancy_space_chunk
                 UNIQUE (space_id, interval_seconds, chunk_start, chunk_end)
         )
+        """,
+        # Add retry_count to occupancy_space_chunks
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_space_chunks' AND column_name = 'retry_count'
+            ) THEN
+                ALTER TABLE occupancy_space_chunks
+                ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+            END IF;
+        END $$;
+        """,
+        # Add timeout_seconds to occupancy_space_chunks
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_space_chunks' AND column_name = 'timeout_seconds'
+            ) THEN
+                ALTER TABLE occupancy_space_chunks
+                ADD COLUMN timeout_seconds INTEGER;
+            END IF;
+        END $$;
         """,
     ]
 

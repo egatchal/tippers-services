@@ -82,9 +82,16 @@ services:
       - PYTHONPATH=/app
       - DAGSTER_HOME=/app/dagster_home
       - DAGSTER_MAX_CONCURRENT=${DAGSTER_MAX_CONCURRENT:-8}
+      - DAGSTER_HOST=${DAGSTER_HOST:-dagster-webserver}
+      - DAGSTER_PORT=${DAGSTER_PORT:-3000}
+      - SOURCE_CHUNK_SENSOR_INTERVAL=${SOURCE_CHUNK_SENSOR_INTERVAL:-30}
+      - CHUNK_TIMEOUT_MULTIPLIER=${CHUNK_TIMEOUT_MULTIPLIER:-2.0}
+      - CHUNK_TIMEOUT_MIN_SECONDS=${CHUNK_TIMEOUT_MIN_SECONDS:-7200}
+      - CHUNK_TIMEOUT_LOOKBACK_DAYS=${CHUNK_TIMEOUT_LOOKBACK_DAYS:-30}
+      - TIMEOUT_SENSOR_INTERVAL_SECONDS=${TIMEOUT_SENSOR_INTERVAL_SECONDS:-60}
     volumes:
       - ./backend:/app/backend
-      - dagster_home:/app/dagster_home
+      - ./dagster_home:/app/dagster_home
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,11 +99,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '${DAGSTER_CPU_LIMIT:-4.0}'
-          memory: ${DAGSTER_MEMORY_LIMIT:-8G}
+          cpus: '${DAGSTER_CPU_LIMIT:-8.0}'
+          memory: ${DAGSTER_MEMORY_LIMIT:-16G}
         reservations:
-          cpus: '1.0'
-          memory: 2G
+          cpus: '2.0'
+          memory: 4G
 
   dagster-webserver:
     build:
@@ -119,7 +126,7 @@ services:
       - "3000:3000"
     volumes:
       - ./backend:/app/backend
-      - dagster_home:/app/dagster_home
+      - ./dagster_home:/app/dagster_home
     depends_on:
       postgres:
         condition: service_healthy
@@ -127,11 +134,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0'
-          memory: 1G
+          cpus: '2.0'
+          memory: 10G
         reservations:
-          cpus: '0.25'
-          memory: 256M
+          cpus: '0.5'
+          memory: 1G
 
   mlflow:
     build:
@@ -161,6 +168,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  dagster_home:
   mlflow_artifacts:
 

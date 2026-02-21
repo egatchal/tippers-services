@@ -214,7 +214,7 @@ class OccupancyDataset(Base):
     start_time       = Column(TIMESTAMP, nullable=False)
     end_time         = Column(TIMESTAMP, nullable=False)
     interval_seconds = Column(Integer, nullable=False)
-    chunk_days       = Column(Integer, nullable=True)
+    # chunk_days removed - always use 1-day chunks (migration: ALTER TABLE occupancy_datasets DROP COLUMN chunk_days)
     status           = Column(String(50), default='PENDING')
     dagster_run_id   = Column(String(255), nullable=True)
     storage_path     = Column(String(500), nullable=True)
@@ -246,6 +246,8 @@ class OccupancySpaceChunk(Base):
     error_message    = Column(Text, nullable=True)
     created_at       = Column(TIMESTAMP, server_default=func.now())
     completed_at     = Column(TIMESTAMP, nullable=True)
+    retry_count      = Column(Integer, default=0, nullable=False)
+    timeout_seconds  = Column(Integer, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(

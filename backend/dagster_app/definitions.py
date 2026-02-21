@@ -3,6 +3,9 @@ from backend.dagster_app import assets
 from backend.dagster_app.assets import (
     occupancy_dataset_failure_sensor,
     occupancy_space_chunk_sensor,
+    occupancy_chunk_timeout_sensor,
+    source_chunk_submission_sensor,
+    dataset_initialization_sensor,
 )
 from backend.dagster_app.resources import database_resource, s3_resource, mlflow_resource
 from backend.dagster_app.jobs import (
@@ -35,6 +38,9 @@ defs = Definitions(
     sensors=[
         occupancy_dataset_failure_sensor,
         occupancy_space_chunk_sensor,
+        occupancy_chunk_timeout_sensor,
+        source_chunk_submission_sensor,
+        dataset_initialization_sensor,
     ],
     resources={
         "database_connection": database_resource,

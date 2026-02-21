@@ -51,9 +51,15 @@ occupancy_dataset_job = occupancy_dataset_graph.to_job(
 materialize_source_chunk_job = source_chunk_graph.to_job(
     name="materialize_source_chunk_job",
     resource_defs={"s3_storage": s3_resource},
+    executor_def=multiprocess_executor.configured({
+        "max_concurrent": int(os.getenv("DAGSTER_MAX_CONCURRENT", "16"))
+    }),
 )
 
 materialize_derived_chunk_job = derived_chunk_graph.to_job(
     name="materialize_derived_chunk_job",
     resource_defs={"s3_storage": s3_resource},
+    executor_def=multiprocess_executor.configured({
+        "max_concurrent": int(os.getenv("DAGSTER_MAX_CONCURRENT", "16"))
+    }),
 )
