@@ -2,22 +2,46 @@
 from dagster import (
     asset, AssetExecutionContext, Output,
     op, OpExecutionContext,
-    DynamicOutput, DynamicOut,
-    graph,
+    graph, In, Out, DynamicOutput, DynamicOut,
     run_failure_sensor, RunFailureSensorContext,
-    sensor, SensorEvaluationContext, RunRequest,
+    sensor, SensorEvaluationContext,
 )
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import pandas as pd
 import numpy as np
 import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any
 import json
 from cryptography.fernet import Fernet
 from jinja2 import Template
+from backend.utils.dataset_registry import register_dataset
+
+
+def _update_unified_job(session, dagster_run_id: str, status: str, error_message: str = None):
+    """Update the unified jobs table for this Dagster run. Non-critical — never raises."""
+    try:
+        now = datetime.utcnow()
+        if status in ("COMPLETED", "FAILED"):
+            session.execute(
+                text("""
+                    UPDATE jobs SET status = :status, error_message = :error, completed_at = :now
+                    WHERE dagster_run_id = :run_id AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                """),
+                {"status": status, "error": error_message, "now": now, "run_id": dagster_run_id},
+            )
+        else:
+            session.execute(
+                text("""
+                    UPDATE jobs SET status = :status, started_at = COALESCE(started_at, :now)
+                    WHERE dagster_run_id = :run_id
+                """),
+                {"status": status, "now": now, "run_id": dagster_run_id},
+            )
+        session.commit()
+    except Exception:
+        pass  # Non-critical
 
 
 def compute_column_stats(df: pd.DataFrame) -> dict:
@@ -70,60 +94,6 @@ def decrypt_password(encrypted_password: str) -> str:
         raise ValueError("ENCRYPTION_KEY environment variable not set")
     cipher_suite = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
     return cipher_suite.decrypt(encrypted_password.encode()).decode()
-
-
-OCCUPANCY_SQL = """
-WITH RECURSIVE subtree AS (
-    SELECT space_id FROM space WHERE space_id = :root_space_id
-    UNION ALL
-    SELECT s.space_id FROM space s
-    JOIN subtree st ON s.parent_space_id = st.space_id
-),
-closure AS (
-    SELECT space_id AS descendant_id, space_id AS ancestor_id
-    FROM subtree
-    UNION ALL
-    SELECT c.descendant_id, sp.parent_space_id AS ancestor_id
-    FROM closure c
-    JOIN space sp ON sp.space_id = c.ancestor_id
-    JOIN subtree st ON st.space_id = sp.parent_space_id
-    WHERE sp.parent_space_id IS NOT NULL
-),
-bins AS (
-    SELECT DISTINCT
-        to_timestamp(gs)::timestamp AS bin_start
-    FROM user_ap_trajectory sess
-    JOIN subtree st ON sess.space_id = st.space_id
-    CROSS JOIN LATERAL generate_series(
-        floor(extract(epoch from GREATEST(sess.start_time, CAST(:chunk_start AS timestamp))) / :interval_seconds)::bigint * :interval_seconds,
-        floor((extract(epoch from LEAST(sess.end_time, CAST(:chunk_end AS timestamp)) - '1 microsecond'::interval)) / :interval_seconds)::bigint * :interval_seconds,
-        :interval_seconds
-    ) gs
-    WHERE sess.start_time < CAST(:chunk_end AS timestamp)
-      AND sess.end_time > CAST(:chunk_start AS timestamp)
-),
-leaf_counts AS (
-    SELECT
-        st.space_id,
-        b.bin_start,
-        COUNT(DISTINCT sess.mac_address) AS connections
-    FROM subtree st
-    CROSS JOIN bins b
-    LEFT JOIN user_ap_trajectory sess ON
-        sess.space_id = st.space_id
-        AND sess.start_time < b.bin_start + (:interval_seconds || ' seconds')::interval
-        AND sess.end_time > b.bin_start
-    GROUP BY st.space_id, b.bin_start
-)
-SELECT
-    c.ancestor_id AS space_id,
-    lc.bin_start AS interval_begin_time,
-    SUM(lc.connections) AS number_connections
-FROM closure c
-JOIN leaf_counts lc ON lc.space_id = c.descendant_id
-GROUP BY c.ancestor_id, lc.bin_start
-ORDER BY c.ancestor_id, lc.bin_start
-"""
 
 
 @asset(
@@ -238,6 +208,25 @@ def materialized_index(context: AssetExecutionContext) -> Output[Dict[str, Any]]
 
         session.commit()
 
+        _update_unified_job(session, context.run_id, "COMPLETED")
+
+        # Register in unified dataset catalog
+        try:
+            register_dataset(
+                session,
+                name=f"Index {index_id}",
+                service="snorkel",
+                dataset_type="index",
+                storage_path=storage_path,
+                row_count=len(df),
+                column_stats=column_stats,
+                schema_info={"columns": {c: str(df[c].dtype) for c in df.columns}},
+                source_ref={"entity_type": "concept_index", "entity_id": index_id},
+                tags={"concept_id": int(index_row.c_id)},
+            )
+        except Exception as cat_err:
+            context.log.warning(f"Failed to register dataset in catalog: {cat_err}")
+
         context.log.info(f"Index {index_id} materialization complete")
 
         return Output(
@@ -256,6 +245,7 @@ def materialized_index(context: AssetExecutionContext) -> Output[Dict[str, Any]]
 
     except Exception as e:
         context.log.error(f"Error materializing index: {str(e)}")
+        _update_unified_job(session, context.run_id, "FAILED", str(e))
         raise
     finally:
         session.close()
@@ -418,6 +408,25 @@ def materialized_rule(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
 
         session.commit()
 
+        _update_unified_job(session, context.run_id, "COMPLETED")
+
+        # Register in unified dataset catalog
+        try:
+            register_dataset(
+                session,
+                name=f"Rule {rule_id} features",
+                service="snorkel",
+                dataset_type="rule_features",
+                storage_path=storage_path,
+                row_count=len(df_features),
+                column_stats=column_stats,
+                schema_info={"columns": {c: str(df_features[c].dtype) for c in df_features.columns}},
+                source_ref={"entity_type": "concept_rule", "entity_id": rule_id},
+                tags={"concept_id": int(rule_row.c_id)},
+            )
+        except Exception as cat_err:
+            context.log.warning(f"Failed to register dataset in catalog: {cat_err}")
+
         context.log.info(f"Rule {rule_id} materialization complete")
 
         return Output(
@@ -436,6 +445,7 @@ def materialized_rule(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
 
     except Exception as e:
         context.log.error(f"Error materializing rule: {str(e)}")
+        _update_unified_job(session, context.run_id, "FAILED", str(e))
         raise
     finally:
         session.close()
@@ -587,6 +597,25 @@ def materialized_feature(context: AssetExecutionContext) -> Output[Dict[str, Any
 
         session.commit()
 
+        _update_unified_job(session, context.run_id, "COMPLETED")
+
+        # Register in unified dataset catalog
+        try:
+            register_dataset(
+                session,
+                name=f"Feature {feature_id}",
+                service="snorkel",
+                dataset_type="features",
+                storage_path=storage_path,
+                row_count=len(df_features),
+                column_stats=column_stats,
+                schema_info={"columns": {c: str(df_features[c].dtype) for c in df_features.columns}},
+                source_ref={"entity_type": "concept_feature", "entity_id": feature_id},
+                tags={"concept_id": int(feature_row.c_id)},
+            )
+        except Exception as cat_err:
+            context.log.warning(f"Failed to register dataset in catalog: {cat_err}")
+
         context.log.info(f"Feature {feature_id} materialization complete")
 
         return Output(
@@ -605,131 +634,216 @@ def materialized_feature(context: AssetExecutionContext) -> Output[Dict[str, Any
 
     except Exception as e:
         context.log.error(f"Error materializing feature: {str(e)}")
+        _update_unified_job(session, context.run_id, "FAILED", str(e))
         raise
     finally:
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# Occupancy — incremental bottom-up materialization
+# ---------------------------------------------------------------------------
+
+SOURCE_CHUNK_SQL = """
+WITH bins AS (
+    SELECT to_timestamp(gs)::timestamp AS bin_start
+    FROM generate_series(
+        floor(extract(epoch from CAST(:chunk_start AS timestamp)) / :interval_seconds)::bigint * :interval_seconds,
+        floor(extract(epoch from CAST(:chunk_end AS timestamp)) / :interval_seconds)::bigint * :interval_seconds - :interval_seconds,
+        :interval_seconds
+    ) gs
+)
+SELECT
+    b.bin_start AS interval_begin_time,
+    COUNT(DISTINCT sess.mac_address) AS number_connections
+FROM bins b
+JOIN user_ap_trajectory sess ON
+    sess.space_id = :space_id
+    AND sess.start_time < b.bin_start + make_interval(secs => :interval_seconds)
+    AND sess.end_time   > b.bin_start
+    AND sess.start_time < CAST(:chunk_end AS timestamp)
+    AND sess.end_time   > CAST(:chunk_start AS timestamp)
+GROUP BY b.bin_start
+ORDER BY b.bin_start
+"""
+
+
 @op(
     config_schema={"dataset_id": int},
-    out=DynamicOut()
+    out=DynamicOut(),
 )
-def plan_occupancy_chunks(context: OpExecutionContext):
+def plan_source_chunks(context: OpExecutionContext):
     """
-    Load occupancy dataset metadata and yield one DynamicOutput per time chunk.
-
-    Sets dataset status to RUNNING and emits chunk descriptors that
-    fetch_occupancy_chunk will process in parallel.
+    Load the dataset record, find all PENDING source (leaf) chunks in its subtree,
+    and yield one DynamicOutput per chunk for parallel fan-out.
     """
     dataset_id = context.op_config["dataset_id"]
 
     engine = get_db_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    DBSession = sessionmaker(bind=engine)
+    session = DBSession()
 
     try:
-        row = session.execute(
+        ds = session.execute(
             text("SELECT * FROM occupancy_datasets WHERE dataset_id = :id"),
             {"id": dataset_id}
         ).fetchone()
 
-        if not row:
-            raise ValueError(f"Occupancy dataset with ID {dataset_id} not found")
+        if not ds:
+            raise ValueError(f"Occupancy dataset {dataset_id} not found")
 
+        root_space_id = ds.root_space_id
+        interval_seconds = ds.interval_seconds
+
+        # Mark dataset as RUNNING
         session.execute(
             text("UPDATE occupancy_datasets SET status = 'RUNNING' WHERE dataset_id = :id"),
             {"id": dataset_id}
         )
         session.commit()
 
-        # Query active dates in the subtree to skip empty chunk windows
+        # Build subtree from tippers
         tippers_engine = get_tippers_engine()
         with tippers_engine.connect() as tconn:
-            active_result = tconn.execute(
+            subtree_rows = tconn.execute(
                 text("""
                 WITH RECURSIVE subtree AS (
-                    SELECT space_id FROM space WHERE space_id = :root_space_id
+                    SELECT space_id, parent_space_id FROM space WHERE space_id = :root
                     UNION ALL
-                    SELECT s.space_id FROM space s
+                    SELECT s.space_id, s.parent_space_id FROM space s
                     JOIN subtree st ON s.parent_space_id = st.space_id
                 )
-                SELECT DISTINCT date_trunc('day', start_time)::date AS active_date
-                FROM user_ap_trajectory
-                WHERE space_id IN (SELECT space_id FROM subtree)
-                  AND start_time >= :start_time AND start_time < :end_time
+                SELECT space_id, parent_space_id FROM subtree
                 """),
-                {
-                    "root_space_id": row.root_space_id,
-                    "start_time": row.start_time,
-                    "end_time": row.end_time,
-                }
-            )
-            active_dates = {r[0] for r in active_result}
+                {"root": root_space_id}
+            ).fetchall()
+        subtree_ids = {r.space_id for r in subtree_rows}
 
-        context.log.info(f"Found {len(active_dates)} active date(s) in range for dataset_id={dataset_id}")
+        # Find PENDING source chunks in this subtree
+        pending_chunks = session.execute(
+            text("""
+            SELECT chunk_id, space_id, chunk_start, chunk_end, space_type
+            FROM occupancy_space_chunks
+            WHERE interval_seconds = :interval
+              AND status = 'PENDING'
+              AND space_type = 'source'
+            ORDER BY chunk_start
+            """),
+            {"interval": interval_seconds}
+        ).fetchall()
 
-        if not active_dates:
-            context.log.info("No data found in range — marking dataset COMPLETED with 0 rows")
-            session.execute(
-                text("""
-                UPDATE occupancy_datasets
-                SET status = 'COMPLETED', row_count = 0, completed_at = now()
-                WHERE dataset_id = :id
-                """),
-                {"id": dataset_id}
-            )
-            session.commit()
-            return  # Yield no DynamicOutputs; merge will run with empty list
+        source_chunks = [c for c in pending_chunks if c.space_id in subtree_ids]
 
-        i = 0
-        if row.chunk_days:
-            chunk_delta = timedelta(days=row.chunk_days)
-            t = row.start_time
-            while t < row.end_time:
-                chunk_end = min(t + chunk_delta, row.end_time)
-                # Only emit chunks that overlap at least one active date
-                chunk_dates = {
-                    (t + timedelta(days=d)).date()
-                    for d in range(max(1, (chunk_end - t).days))
-                }
-                if chunk_dates & active_dates:
-                    yield DynamicOutput(
-                        value={
-                            "dataset_id": dataset_id,
-                            "chunk_index": i,
-                            "chunk_start": t.isoformat(),
-                            "chunk_end": chunk_end.isoformat(),
-                            "root_space_id": row.root_space_id,
-                            "interval_seconds": row.interval_seconds,
-                        },
-                        mapping_key=f"chunk_{i}"
-                    )
-                t += chunk_delta
-                i += 1
-        else:
+        context.log.info(
+            f"Dataset {dataset_id}: {len(source_chunks)} PENDING source chunks to fan out"
+        )
+
+        for chunk in source_chunks:
+            mapping_key = f"chunk_{chunk.chunk_id}"
             yield DynamicOutput(
                 value={
+                    "chunk_id": chunk.chunk_id,
+                    "space_id": chunk.space_id,
+                    "chunk_start": chunk.chunk_start.isoformat(),
+                    "chunk_end": chunk.chunk_end.isoformat(),
+                    "interval_seconds": interval_seconds,
                     "dataset_id": dataset_id,
-                    "chunk_index": 0,
-                    "chunk_start": row.start_time.isoformat(),
-                    "chunk_end": row.end_time.isoformat(),
-                    "root_space_id": row.root_space_id,
-                    "interval_seconds": row.interval_seconds,
                 },
-                mapping_key="chunk_0"
+                mapping_key=mapping_key,
             )
 
-        context.log.info(f"Planned chunk(s) for dataset_id={dataset_id} (skipping empty windows)")
+    finally:
+        session.close()
 
-    except Exception as e:
-        context.log.error(f"Error planning occupancy chunks: {str(e)}")
+
+@op(
+    required_resource_keys={"s3_storage"},
+)
+def process_source_chunk(context: OpExecutionContext, chunk_info: dict) -> dict:
+    """
+    Process a single source (leaf) chunk: query tippers, upload parquet to S3,
+    mark COMPLETED. Runs in parallel via multiprocess executor.
+    """
+    chunk_id = chunk_info["chunk_id"]
+    space_id = chunk_info["space_id"]
+    chunk_start = chunk_info["chunk_start"]
+    chunk_end = chunk_info["chunk_end"]
+    interval_seconds = chunk_info["interval_seconds"]
+
+    engine = get_db_engine()
+    DBSession = sessionmaker(bind=engine)
+    session = DBSession()
+
+    try:
+        # Mark chunk RUNNING
+        session.execute(
+            text("UPDATE occupancy_space_chunks SET status = 'RUNNING' WHERE chunk_id = :id"),
+            {"id": chunk_id}
+        )
+        session.commit()
+
+        context.log.info(
+            f"Source chunk {chunk_id}: space={space_id}, {chunk_start} -> {chunk_end}"
+        )
+
+        tippers_engine = get_tippers_engine()
+        params = {
+            "space_id": space_id,
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+            "interval_seconds": interval_seconds,
+        }
+        df = pd.read_sql(text(SOURCE_CHUNK_SQL), tippers_engine, params=params)
+
+        cs_dt = datetime.fromisoformat(chunk_start)
+        ce_dt = datetime.fromisoformat(chunk_end)
+        cs_str = cs_dt.strftime('%Y%m%dT%H%M%S')
+        ce_str = ce_dt.strftime('%Y%m%dT%H%M%S')
+        s3_key = f"occupancy/spaces/{space_id}/{interval_seconds}/{cs_str}_{ce_str}.parquet"
+        local_path = f"/tmp/source_chunk_{chunk_id}.parquet"
+        df.to_parquet(local_path, index=False)
+
+        s3_client = context.resources.s3_storage.get_client()
+        s3_bucket = context.resources.s3_storage.bucket_name
+        s3_client.upload_file(local_path, s3_bucket, s3_key)
+        storage_path = f"s3://{s3_bucket}/{s3_key}"
+
         session.execute(
             text("""
-            UPDATE occupancy_datasets
-            SET status = 'FAILED', error_message = :error, completed_at = now()
-            WHERE dataset_id = :id
+            UPDATE occupancy_space_chunks
+            SET status = 'COMPLETED', storage_path = :path, completed_at = :now
+            WHERE chunk_id = :id
             """),
-            {"error": str(e), "id": dataset_id}
+            {"path": storage_path, "now": datetime.utcnow(), "id": chunk_id}
+        )
+        session.commit()
+        context.log.info(f"Source chunk {chunk_id}: {len(df)} bins -> {storage_path}")
+
+        # Register in unified dataset catalog
+        try:
+            register_dataset(
+                session,
+                name=f"Occupancy space {space_id} ({interval_seconds}s)",
+                service="occupancy",
+                dataset_type="occupancy_space_chunk",
+                storage_path=storage_path,
+                row_count=len(df),
+                source_ref={"entity_type": "occupancy_space_chunk", "space_id": space_id, "interval_seconds": interval_seconds},
+                tags={"space_id": space_id, "interval_seconds": interval_seconds, "space_type": "source"},
+            )
+        except Exception:
+            pass  # Non-critical
+
+        return chunk_info
+
+    except Exception as e:
+        session.execute(
+            text("""
+            UPDATE occupancy_space_chunks
+            SET status = 'FAILED', completed_at = :now
+            WHERE chunk_id = :id AND status != 'COMPLETED'
+            """),
+            {"now": datetime.utcnow(), "id": chunk_id}
         )
         session.commit()
         raise
@@ -737,110 +851,208 @@ def plan_occupancy_chunks(context: OpExecutionContext):
         session.close()
 
 
-@op(required_resource_keys={"s3_storage"})
-def fetch_occupancy_chunk(context: OpExecutionContext, chunk: dict) -> str:
+@op(
+    required_resource_keys={"s3_storage"},
+    config_schema={"dataset_id": int},
+)
+def aggregate_and_assemble(context: OpExecutionContext, source_results: list) -> None:
     """
-    Fetch one occupancy time chunk from the tippers DB and upload to S3.
+    Phase 1: Process derived (parent) chunks bottom-up — sum children's COMPLETED parquets.
+    Phase 2: Assemble final dataset parquet from root space's COMPLETED chunks.
 
-    Idempotent: if the chunk Parquet already exists in S3, returns its path
-    immediately without re-running the query (enables resumable re-runs).
+    Runs after all source chunks complete (guaranteed by .collect()).
     """
-    dataset_id = chunk["dataset_id"]
-    chunk_index = chunk["chunk_index"]
-    chunk_start = chunk["chunk_start"]
-    chunk_end = chunk["chunk_end"]
-    root_space_id = chunk["root_space_id"]
-    interval_seconds = chunk["interval_seconds"]
-
-    s3_client = context.resources.s3_storage.get_client()
-    s3_bucket = context.resources.s3_storage.bucket_name
-    s3_key = f"occupancy/chunks/dataset_{dataset_id}/chunk_{chunk_index}.parquet"
-    s3_path = f"s3://{s3_bucket}/{s3_key}"
-
-    # Resumability check: skip if chunk already uploaded
-    try:
-        s3_client.head_object(Bucket=s3_bucket, Key=s3_key)
-        context.log.info(f"Chunk {chunk_index} already exists at {s3_path}, skipping")
-        return s3_path
-    except Exception:
-        pass  # Object does not exist — proceed with query
-
-    context.log.info(f"Fetching chunk {chunk_index}: {chunk_start} → {chunk_end}")
-
-    tippers_engine = get_tippers_engine()
-    params = {
-        "root_space_id": root_space_id,
-        "chunk_start": chunk_start,
-        "chunk_end": chunk_end,
-        "interval_seconds": interval_seconds,
-    }
-
-    chunk_df = pd.read_sql(text(OCCUPANCY_SQL), tippers_engine, params=params)
-    context.log.info(f"Chunk {chunk_index}: {len(chunk_df)} rows")
-
-    local_path = f"/tmp/occupancy_chunk_{dataset_id}_{chunk_index}.parquet"
-    chunk_df.to_parquet(local_path, index=False)
-    s3_client.upload_file(local_path, s3_bucket, s3_key)
-    context.log.info(f"Uploaded chunk {chunk_index} to {s3_path}")
-
-    return s3_path
-
-
-@op(required_resource_keys={"s3_storage"})
-def merge_occupancy_chunks(context: OpExecutionContext, chunk_paths: list) -> None:
-    """
-    Download all chunk Parquets, concatenate, and store the final dataset.
-
-    Updates DB status to COMPLETED and cleans up intermediate chunk files.
-    """
-    if not chunk_paths:
-        context.log.info("No chunk paths provided — dataset was already handled by planner (0 rows)")
-        return
-
-    match = re.search(r"dataset_(\d+)", chunk_paths[0])
-    if not match:
-        raise ValueError(f"Could not parse dataset_id from path: {chunk_paths[0]}")
-    dataset_id = int(match.group(1))
-
-    context.log.info(f"Merging {len(chunk_paths)} chunks for dataset_id={dataset_id}")
-
-    s3_client = context.resources.s3_storage.get_client()
-    s3_bucket = context.resources.s3_storage.bucket_name
+    dataset_id = context.op_config["dataset_id"]
 
     engine = get_db_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    DBSession = sessionmaker(bind=engine)
+    session = DBSession()
 
     try:
-        dfs = []
-        for i, s3_path in enumerate(chunk_paths):
-            s3_key = s3_path.replace(f"s3://{s3_bucket}/", "")
-            local_path = f"/tmp/merge_chunk_{dataset_id}_{i}.parquet"
-            s3_client.download_file(s3_bucket, s3_key, local_path)
-            dfs.append(pd.read_parquet(local_path))
+        ds = session.execute(
+            text("SELECT * FROM occupancy_datasets WHERE dataset_id = :id"),
+            {"id": dataset_id}
+        ).fetchone()
 
-        df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
-            columns=["space_id", "interval_begin_time", "number_connections"]
+        if not ds:
+            raise ValueError(f"Occupancy dataset {dataset_id} not found")
+
+        root_space_id = ds.root_space_id
+        interval_seconds = ds.interval_seconds
+        start_time = ds.start_time
+        end_time = ds.end_time
+
+        # Build subtree
+        tippers_engine = get_tippers_engine()
+        with tippers_engine.connect() as tconn:
+            subtree_rows = tconn.execute(
+                text("""
+                WITH RECURSIVE subtree AS (
+                    SELECT space_id, parent_space_id FROM space WHERE space_id = :root
+                    UNION ALL
+                    SELECT s.space_id, s.parent_space_id FROM space s
+                    JOIN subtree st ON s.parent_space_id = st.space_id
+                )
+                SELECT space_id, parent_space_id FROM subtree
+                """),
+                {"root": root_space_id}
+            ).fetchall()
+        subtree_ids = {r.space_id for r in subtree_rows}
+        parent_map = {r.space_id: r.parent_space_id for r in subtree_rows}
+
+        # Find PENDING derived chunks in this subtree
+        derived_chunks = session.execute(
+            text("""
+            SELECT chunk_id, space_id, chunk_start, chunk_end, space_type
+            FROM occupancy_space_chunks
+            WHERE interval_seconds = :interval
+              AND status = 'PENDING'
+              AND space_type = 'derived'
+            ORDER BY chunk_start
+            """),
+            {"interval": interval_seconds}
+        ).fetchall()
+        derived_chunks = [c for c in derived_chunks if c.space_id in subtree_ids]
+
+        s3_client = context.resources.s3_storage.get_client()
+        s3_bucket = context.resources.s3_storage.bucket_name
+
+        context.log.info(
+            f"Dataset {dataset_id}: {len(source_results)} source chunks done, "
+            f"{len(derived_chunks)} derived chunks to process"
         )
 
-        context.log.info(f"Total rows after merge: {len(df)}")
+        # ----- Phase 1: Derived spaces (bottom-up by depth) -----
+        def _depth(sid):
+            d = 0
+            cur = sid
+            while parent_map.get(cur) is not None and parent_map[cur] in subtree_ids:
+                cur = parent_map[cur]
+                d += 1
+            return d
 
-        column_stats = compute_column_stats(df)
+        derived_chunks_sorted = sorted(derived_chunks, key=lambda c: -_depth(c.space_id))
+
+        for chunk in derived_chunks_sorted:
+            context.log.info(
+                f"Derived chunk {chunk.chunk_id}: space={chunk.space_id}, "
+                f"{chunk.chunk_start} -> {chunk.chunk_end}"
+            )
+            session.execute(
+                text("UPDATE occupancy_space_chunks SET status = 'RUNNING' WHERE chunk_id = :id"),
+                {"id": chunk.chunk_id}
+            )
+            session.commit()
+
+            with tippers_engine.connect() as tconn:
+                children = tconn.execute(
+                    text("SELECT space_id FROM space WHERE parent_space_id = :pid"),
+                    {"pid": chunk.space_id}
+                ).fetchall()
+            child_ids = [c.space_id for c in children]
+
+            dfs = []
+            for child_id in child_ids:
+                child_row = session.execute(
+                    text("""
+                    SELECT storage_path FROM occupancy_space_chunks
+                    WHERE space_id = :sid
+                      AND interval_seconds = :interval
+                      AND chunk_start = :cs AND chunk_end = :ce
+                      AND status = 'COMPLETED'
+                    """),
+                    {
+                        "sid": child_id,
+                        "interval": interval_seconds,
+                        "cs": chunk.chunk_start,
+                        "ce": chunk.chunk_end,
+                    }
+                ).fetchone()
+                if not child_row or not child_row.storage_path:
+                    continue
+                sp = child_row.storage_path
+                if sp.startswith("s3://"):
+                    parts = sp.replace("s3://", "").split("/", 1)
+                    lp = f"/tmp/derived_child_{child_id}_chunk_{chunk.chunk_id}.parquet"
+                    s3_client.download_file(parts[0], parts[1], lp)
+                    dfs.append(pd.read_parquet(lp))
+                elif os.path.exists(sp):
+                    dfs.append(pd.read_parquet(sp))
+
+            if dfs:
+                combined = pd.concat(dfs, ignore_index=True)
+                df = (
+                    combined.groupby('interval_begin_time', as_index=False)['number_connections']
+                    .sum()
+                    .sort_values('interval_begin_time')
+                    .reset_index(drop=True)
+                )
+            else:
+                df = pd.DataFrame(columns=['interval_begin_time', 'number_connections'])
+
+            cs_str = chunk.chunk_start.strftime('%Y%m%dT%H%M%S')
+            ce_str = chunk.chunk_end.strftime('%Y%m%dT%H%M%S')
+            s3_key = f"occupancy/spaces/{chunk.space_id}/{interval_seconds}/{cs_str}_{ce_str}.parquet"
+            local_path = f"/tmp/derived_chunk_{chunk.chunk_id}.parquet"
+            df.to_parquet(local_path, index=False)
+            s3_client.upload_file(local_path, s3_bucket, s3_key)
+            storage_path = f"s3://{s3_bucket}/{s3_key}"
+
+            session.execute(
+                text("""
+                UPDATE occupancy_space_chunks
+                SET status = 'COMPLETED', storage_path = :path, completed_at = :now
+                WHERE chunk_id = :id
+                """),
+                {"path": storage_path, "now": datetime.utcnow(), "id": chunk.chunk_id}
+            )
+            session.commit()
+            context.log.info(f"Derived chunk {chunk.chunk_id}: {len(df)} aggregated bins -> {storage_path}")
+
+        # ----- Phase 2: Assemble final dataset parquet -----
+        root_chunks = session.execute(
+            text("""
+            SELECT storage_path, chunk_start FROM occupancy_space_chunks
+            WHERE space_id = :sid
+              AND interval_seconds = :interval
+              AND status = 'COMPLETED'
+              AND chunk_start < :end_time
+              AND chunk_end > :start_time
+            ORDER BY chunk_start
+            """),
+            {
+                "sid": root_space_id,
+                "interval": interval_seconds,
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        ).fetchall()
+
+        dfs = []
+        for rc in root_chunks:
+            if not rc.storage_path:
+                continue
+            sp = rc.storage_path
+            if sp.startswith("s3://"):
+                parts = sp.replace("s3://", "").split("/", 1)
+                lp = f"/tmp/root_assemble_{dataset_id}_{len(dfs)}.parquet"
+                s3_client.download_file(parts[0], parts[1], lp)
+                dfs.append(pd.read_parquet(lp))
+            elif os.path.exists(sp):
+                dfs.append(pd.read_parquet(sp))
+
+        if dfs:
+            df = pd.concat(dfs, ignore_index=True).sort_values('interval_begin_time').reset_index(drop=True)
+        else:
+            df = pd.DataFrame(columns=['interval_begin_time', 'number_connections'])
+
+        column_stats = compute_column_stats(df) if len(df) > 0 else {}
 
         final_s3_key = f"occupancy/datasets/{dataset_id}/data.parquet"
         final_local_path = f"/tmp/occupancy_{dataset_id}_final.parquet"
         df.to_parquet(final_local_path, index=False)
         s3_client.upload_file(final_local_path, s3_bucket, final_s3_key)
-        storage_path = f"s3://{s3_bucket}/{final_s3_key}"
-        context.log.info(f"Uploaded final dataset to {storage_path}")
-
-        # Clean up intermediate chunk files
-        for s3_path in chunk_paths:
-            chunk_key = s3_path.replace(f"s3://{s3_bucket}/", "")
-            try:
-                s3_client.delete_object(Bucket=s3_bucket, Key=chunk_key)
-            except Exception as del_err:
-                context.log.warning(f"Failed to delete chunk {chunk_key}: {del_err}")
+        final_storage_path = f"s3://{s3_bucket}/{final_s3_key}"
 
         session.execute(
             text("""
@@ -853,7 +1065,7 @@ def merge_occupancy_chunks(context: OpExecutionContext, chunk_paths: list) -> No
             WHERE dataset_id = :id
             """),
             {
-                "path": storage_path,
+                "path": final_storage_path,
                 "rc": len(df),
                 "cs": json.dumps(column_stats),
                 "id": dataset_id,
@@ -861,10 +1073,44 @@ def merge_occupancy_chunks(context: OpExecutionContext, chunk_paths: list) -> No
         )
         session.commit()
 
-        context.log.info(f"Occupancy dataset {dataset_id} merge complete")
+        _update_unified_job(session, context.run_id, "COMPLETED")
+
+        # Sync the linked parent datasets row (created at request time)
+        try:
+            session.execute(
+                text("""
+                UPDATE datasets
+                SET storage_path = :path,
+                    row_count = :rc,
+                    column_stats = CAST(:cs AS jsonb),
+                    schema_info = CAST(:si AS jsonb),
+                    status = 'AVAILABLE',
+                    updated_at = NOW()
+                WHERE dataset_id = (
+                    SELECT parent_dataset_id FROM occupancy_datasets WHERE dataset_id = :occ_id
+                )
+                """),
+                {
+                    "path": final_storage_path,
+                    "rc": len(df),
+                    "cs": json.dumps(column_stats),
+                    "si": json.dumps({"columns": {c: str(df[c].dtype) for c in df.columns}}),
+                    "occ_id": dataset_id,
+                }
+            )
+            session.commit()
+            context.log.info(f"Synced parent datasets row for occupancy dataset {dataset_id}")
+        except Exception as cat_err:
+            context.log.error(f"Failed to sync parent datasets row: {cat_err}")
+            import traceback
+            context.log.error(traceback.format_exc())
+
+        context.log.info(
+            f"Dataset {dataset_id} COMPLETED: {len(df)} rows -> {final_storage_path}"
+        )
 
     except Exception as e:
-        context.log.error(f"Error merging occupancy chunks: {str(e)}")
+        context.log.error(f"Dataset {dataset_id} FAILED: {e}")
         session.execute(
             text("""
             UPDATE occupancy_datasets
@@ -873,32 +1119,45 @@ def merge_occupancy_chunks(context: OpExecutionContext, chunk_paths: list) -> No
             """),
             {"error": str(e), "id": dataset_id}
         )
+        # Mark the linked parent datasets row as STALE
+        session.execute(
+            text("""
+            UPDATE datasets
+            SET status = 'STALE', updated_at = NOW()
+            WHERE dataset_id = (
+                SELECT parent_dataset_id FROM occupancy_datasets WHERE dataset_id = :id
+            )
+              AND status != 'STALE'
+            """),
+            {"id": dataset_id}
+        )
         session.commit()
+        _update_unified_job(session, context.run_id, "FAILED", str(e))
         raise
     finally:
         session.close()
 
 
 @graph
-def occupancy_dataset_graph():
-    chunk_paths = plan_occupancy_chunks().map(fetch_occupancy_chunk)
-    merge_occupancy_chunks(chunk_paths.collect())
+def occupancy_incremental_graph():
+    source_results = plan_source_chunks().map(process_source_chunk)
+    aggregate_and_assemble(source_results.collect())
 
 
 @run_failure_sensor
 def occupancy_dataset_failure_sensor(context: RunFailureSensorContext):
-    """Mark occupancy dataset as FAILED if the Dagster run fails before merge completes."""
-    if context.dagster_run.job_name != "occupancy_dataset_job":
+    """Mark occupancy dataset as FAILED if the Dagster run fails."""
+    if context.dagster_run.job_name != "occupancy_incremental_job":
         return
 
     try:
-        dataset_id = context.dagster_run.run_config["ops"]["plan_occupancy_chunks"]["config"]["dataset_id"]
+        dataset_id = context.dagster_run.run_config["ops"]["plan_source_chunks"]["config"]["dataset_id"]
     except (KeyError, TypeError):
         return
 
     engine = get_db_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    DBSession = sessionmaker(bind=engine)
+    session = DBSession()
     try:
         session.execute(
             text("""
@@ -912,6 +1171,18 @@ def occupancy_dataset_failure_sensor(context: RunFailureSensorContext):
                 "error": f"Dagster run {context.dagster_run.run_id} failed",
                 "id": dataset_id,
             }
+        )
+        # Also mark the linked parent datasets row as STALE
+        session.execute(
+            text("""
+            UPDATE datasets
+            SET status = 'STALE', updated_at = NOW()
+            WHERE dataset_id = (
+                SELECT parent_dataset_id FROM occupancy_datasets WHERE dataset_id = :id
+            )
+              AND status != 'STALE'
+            """),
+            {"id": dataset_id}
         )
         session.commit()
     finally:
@@ -1412,6 +1683,24 @@ def snorkel_training(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
 
         session.commit()
 
+        _update_unified_job(session, context.run_id, "COMPLETED")
+
+        # Register in unified dataset catalog
+        try:
+            register_dataset(
+                session,
+                name=f"Snorkel labels (job {job_id})",
+                service="snorkel",
+                dataset_type="labels",
+                format="json",
+                storage_path=storage_path,
+                row_count=n_samples,
+                source_ref={"entity_type": "snorkel_job", "entity_id": job_id},
+                tags={"concept_id": int(job_row.c_id)},
+            )
+        except Exception as cat_err:
+            context.log.warning(f"Failed to register dataset in catalog: {cat_err}")
+
         context.log.info(f"Snorkel job {job_id} complete")
 
         return Output(
@@ -1431,6 +1720,7 @@ def snorkel_training(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
 
     except Exception as e:
         context.log.error(f"Error in Snorkel training: {str(e)}")
+        _update_unified_job(session, context.run_id, "FAILED", str(e))
 
         session.execute(
             text("""
@@ -1827,6 +2117,24 @@ def classifier_training(context: AssetExecutionContext) -> Output[Dict[str, Any]
 
         session.commit()
 
+        _update_unified_job(session, context.run_id, "COMPLETED")
+
+        # Register in unified dataset catalog
+        try:
+            register_dataset(
+                session,
+                name=f"Classifier results (job {job_id})",
+                service="snorkel",
+                dataset_type="training",
+                format="json",
+                storage_path=storage_path,
+                row_count=n_samples_after,
+                source_ref={"entity_type": "classifier_job", "entity_id": job_id},
+                tags={"concept_id": int(job_row.c_id)},
+            )
+        except Exception as cat_err:
+            context.log.warning(f"Failed to register dataset in catalog: {cat_err}")
+
         context.log.info(f"Classifier job {job_id} complete")
 
         return Output(
@@ -1844,6 +2152,7 @@ def classifier_training(context: AssetExecutionContext) -> Output[Dict[str, Any]
 
     except Exception as e:
         context.log.error(f"Error in classifier training: {str(e)}")
+        _update_unified_job(session, context.run_id, "FAILED", str(e))
 
         session.execute(
             text("""
@@ -1867,327 +2176,32 @@ def classifier_training(context: AssetExecutionContext) -> Output[Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# Per-space chunk ops (bottom-up occupancy materialization)
-# ---------------------------------------------------------------------------
-
-SOURCE_CHUNK_SQL = """
-WITH bins AS (
-    SELECT to_timestamp(gs)::timestamp AS bin_start
-    FROM generate_series(
-        floor(extract(epoch from CAST(:chunk_start AS timestamp)) / :interval_seconds)::bigint * :interval_seconds,
-        floor(extract(epoch from CAST(:chunk_end AS timestamp)) / :interval_seconds)::bigint * :interval_seconds - :interval_seconds,
-        :interval_seconds
-    ) gs
-)
-SELECT
-    b.bin_start AS interval_begin_time,
-    COUNT(DISTINCT sess.mac_address) AS number_connections
-FROM bins b
-JOIN user_ap_trajectory sess ON
-    sess.space_id = :space_id
-    AND sess.start_time < b.bin_start + make_interval(secs => :interval_seconds)
-    AND sess.end_time   > b.bin_start
-    AND sess.start_time < CAST(:chunk_end AS timestamp)
-    AND sess.end_time   > CAST(:chunk_start AS timestamp)
-GROUP BY b.bin_start
-ORDER BY b.bin_start
-"""
-
-
-@op(
-    required_resource_keys={"s3_storage"},
-    config_schema={"chunk_id": int},
-)
-def materialize_source_chunk(context: OpExecutionContext) -> None:
-    """Compute occupancy bins for one source space chunk and upload to S3."""
-    chunk_id = context.op_config["chunk_id"]
-
+@sensor(minimum_interval_seconds=30, name="workflow_advance_sensor")
+def workflow_advance_sensor(context: SensorEvaluationContext):
+    """Poll running workflow runs and advance them by submitting unblocked steps."""
     engine = get_db_engine()
     Session = sessionmaker(bind=engine)
     session = Session()
 
     try:
-        row = session.execute(
-            text("SELECT * FROM occupancy_space_chunks WHERE chunk_id = :id"),
-            {"id": chunk_id}
-        ).fetchone()
+        from backend.utils.workflow_engine import WorkflowEngine
 
-        if not row:
-            raise ValueError(f"OccupancySpaceChunk {chunk_id} not found")
-
-        space_id = row.space_id
-        interval_seconds = row.interval_seconds
-        chunk_start = row.chunk_start
-        chunk_end = row.chunk_end
-
-        session.execute(
-            text("UPDATE occupancy_space_chunks SET status = 'RUNNING' WHERE chunk_id = :id"),
-            {"id": chunk_id}
-        )
-        session.commit()
-
-        context.log.info(f"Source chunk {chunk_id}: space={space_id}, {chunk_start} -> {chunk_end}")
-
-        tippers_engine = get_tippers_engine()
-        params = {
-            "space_id": space_id,
-            "chunk_start": chunk_start.isoformat(),
-            "chunk_end": chunk_end.isoformat(),
-            "interval_seconds": interval_seconds,
-        }
-        df = pd.read_sql(text(SOURCE_CHUNK_SQL), tippers_engine, params=params)
-
-        context.log.info(f"Source chunk {chunk_id}: {len(df)} bins computed")
-
-        s3_client = context.resources.s3_storage.get_client()
-        s3_bucket = context.resources.s3_storage.bucket_name
-        chunk_start_str = chunk_start.strftime('%Y%m%dT%H%M%S')
-        chunk_end_str = chunk_end.strftime('%Y%m%dT%H%M%S')
-        s3_key = f"occupancy/spaces/{space_id}/{interval_seconds}/chunk_{chunk_start_str}_{chunk_end_str}.parquet"
-
-        local_path = f"/tmp/source_chunk_{chunk_id}.parquet"
-        df.to_parquet(local_path, index=False)
-        s3_client.upload_file(local_path, s3_bucket, s3_key)
-        storage_path = f"s3://{s3_bucket}/{s3_key}"
-
-        context.log.info(f"Source chunk {chunk_id} uploaded to {storage_path}")
-
-        session.execute(
-            text("""
-            UPDATE occupancy_space_chunks
-            SET status = 'COMPLETED', storage_path = :path, completed_at = :now
-            WHERE chunk_id = :id
-            """),
-            {"path": storage_path, "now": datetime.utcnow(), "id": chunk_id}
-        )
-        session.commit()
-
-    except Exception as e:
-        context.log.error(f"Source chunk {chunk_id} failed: {e}")
-        session.execute(
-            text("""
-            UPDATE occupancy_space_chunks
-            SET status = 'FAILED', error_message = :err, completed_at = :now
-            WHERE chunk_id = :id
-            """),
-            {"err": str(e), "now": datetime.utcnow(), "id": chunk_id}
-        )
-        session.commit()
-        raise
-    finally:
-        session.close()
-
-
-@op(
-    required_resource_keys={"s3_storage"},
-    config_schema={"chunk_id": int},
-)
-def materialize_derived_chunk(context: OpExecutionContext) -> None:
-    """Sum children's chunk parquets to produce one derived space chunk."""
-    chunk_id = context.op_config["chunk_id"]
-
-    engine = get_db_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
-
-    try:
-        row = session.execute(
-            text("SELECT * FROM occupancy_space_chunks WHERE chunk_id = :id"),
-            {"id": chunk_id}
-        ).fetchone()
-
-        if not row:
-            raise ValueError(f"OccupancySpaceChunk {chunk_id} not found")
-
-        space_id = row.space_id
-        interval_seconds = row.interval_seconds
-        chunk_start = row.chunk_start
-        chunk_end = row.chunk_end
-
-        session.execute(
-            text("UPDATE occupancy_space_chunks SET status = 'RUNNING' WHERE chunk_id = :id"),
-            {"id": chunk_id}
-        )
-        session.commit()
-
-        context.log.info(f"Derived chunk {chunk_id}: space={space_id}, {chunk_start} -> {chunk_end}")
-
-        tippers_engine = get_tippers_engine()
-        with tippers_engine.connect() as tconn:
-            children = tconn.execute(
-                text("SELECT space_id FROM space WHERE parent_space_id = :pid"),
-                {"pid": space_id}
-            ).fetchall()
-        child_ids = [c.space_id for c in children]
-
-        context.log.info(f"Derived chunk {chunk_id}: {len(child_ids)} children to aggregate")
-
-        s3_client = context.resources.s3_storage.get_client()
-        s3_bucket = context.resources.s3_storage.bucket_name
-
-        dfs = []
-        for child_id in child_ids:
-            child_row = session.execute(
-                text("""
-                SELECT storage_path FROM occupancy_space_chunks
-                WHERE space_id = :sid
-                  AND interval_seconds = :interval
-                  AND chunk_start = :cs
-                  AND chunk_end = :ce
-                  AND status = 'COMPLETED'
-                """),
-                {
-                    "sid": child_id,
-                    "interval": interval_seconds,
-                    "cs": chunk_start,
-                    "ce": chunk_end,
-                }
-            ).fetchone()
-
-            if not child_row or not child_row.storage_path:
-                context.log.info(f"Child space {child_id}: no COMPLETED chunk, skipping")
-                continue
-
-            storage_path = child_row.storage_path
-            if storage_path.startswith("s3://"):
-                parts = storage_path.replace("s3://", "").split("/", 1)
-                local_path = f"/tmp/derived_child_{child_id}_chunk_{chunk_id}.parquet"
-                s3_client.download_file(parts[0], parts[1], local_path)
-                dfs.append(pd.read_parquet(local_path))
-            elif os.path.exists(storage_path):
-                dfs.append(pd.read_parquet(storage_path))
-
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            df = (
-                combined.groupby('interval_begin_time', as_index=False)['number_connections']
-                .sum()
-                .sort_values('interval_begin_time')
-                .reset_index(drop=True)
-            )
-        else:
-            df = pd.DataFrame(columns=['interval_begin_time', 'number_connections'])
-
-        context.log.info(f"Derived chunk {chunk_id}: {len(df)} aggregated bins")
-
-        chunk_start_str = chunk_start.strftime('%Y%m%dT%H%M%S')
-        chunk_end_str = chunk_end.strftime('%Y%m%dT%H%M%S')
-        s3_key = f"occupancy/spaces/{space_id}/{interval_seconds}/chunk_{chunk_start_str}_{chunk_end_str}.parquet"
-
-        local_path = f"/tmp/derived_chunk_{chunk_id}.parquet"
-        df.to_parquet(local_path, index=False)
-        s3_client.upload_file(local_path, s3_bucket, s3_key)
-        storage_path = f"s3://{s3_bucket}/{s3_key}"
-
-        context.log.info(f"Derived chunk {chunk_id} uploaded to {storage_path}")
-
-        session.execute(
-            text("""
-            UPDATE occupancy_space_chunks
-            SET status = 'COMPLETED', storage_path = :path, completed_at = :now
-            WHERE chunk_id = :id
-            """),
-            {"path": storage_path, "now": datetime.utcnow(), "id": chunk_id}
-        )
-        session.commit()
-
-    except Exception as e:
-        context.log.error(f"Derived chunk {chunk_id} failed: {e}")
-        session.execute(
-            text("""
-            UPDATE occupancy_space_chunks
-            SET status = 'FAILED', error_message = :err, completed_at = :now
-            WHERE chunk_id = :id
-            """),
-            {"err": str(e), "now": datetime.utcnow(), "id": chunk_id}
-        )
-        session.commit()
-        raise
-    finally:
-        session.close()
-
-
-@graph
-def source_chunk_graph():
-    materialize_source_chunk()
-
-
-@graph
-def derived_chunk_graph():
-    materialize_derived_chunk()
-
-
-@sensor(minimum_interval_seconds=30, name="occupancy_space_chunk_sensor", job_name="materialize_derived_chunk_job")
-def occupancy_space_chunk_sensor(context: SensorEvaluationContext):
-    """
-    Triggers derived chunk jobs when all their children's source chunks are COMPLETED.
-    Uses run_key per chunk_id so Dagster deduplicates submissions automatically.
-    """
-    engine = get_db_engine()
-    tippers_engine = get_tippers_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
-
-    try:
-        pending_derived = session.execute(
-            text("""
-            SELECT chunk_id, space_id, interval_seconds, chunk_start, chunk_end
-            FROM occupancy_space_chunks
-            WHERE space_type = 'derived' AND status = 'PENDING'
-            ORDER BY chunk_start
-            """)
+        running_runs = session.execute(
+            text("SELECT run_id FROM workflow_runs WHERE status = 'RUNNING'")
         ).fetchall()
 
-        for chunk in pending_derived:
+        if not running_runs:
+            return
+
+        wf_engine = WorkflowEngine(session)
+        for row in running_runs:
             try:
-                with tippers_engine.connect() as tconn:
-                    children = tconn.execute(
-                        text("SELECT space_id FROM space WHERE parent_space_id = :pid"),
-                        {"pid": chunk.space_id}
-                    ).fetchall()
-                child_ids = [c.space_id for c in children]
+                wf_engine.advance_run(row.run_id)
+                context.log.info(f"Advanced workflow run {row.run_id}")
             except Exception as e:
-                context.log.warning(f"Tippers query failed for space {chunk.space_id}: {e}")
-                continue
-
-            if not child_ids:
-                continue
-
-            # All children WITH chunk records for this window must be COMPLETED.
-            # Children with no record have no data and contribute 0 (skip gracefully).
-            child_records = session.execute(
-                text("""
-                SELECT space_id, status FROM occupancy_space_chunks
-                WHERE space_id = ANY(:child_ids)
-                  AND interval_seconds = :interval
-                  AND chunk_start = :cs
-                  AND chunk_end = :ce
-                """),
-                {
-                    "child_ids": child_ids,
-                    "interval": chunk.interval_seconds,
-                    "cs": chunk.chunk_start,
-                    "ce": chunk.chunk_end,
-                }
-            ).fetchall()
-
-            all_ready = all(r.status == 'COMPLETED' for r in child_records)
-            if not all_ready:
-                continue
-
-            yield RunRequest(
-                run_key=f"derived_chunk_{chunk.chunk_id}",
-                job_name="materialize_derived_chunk_job",
-                run_config={
-                    "ops": {
-                        "materialize_derived_chunk": {
-                            "config": {"chunk_id": chunk.chunk_id}
-                        }
-                    }
-                }
-            )
+                context.log.warning(f"Failed to advance workflow run {row.run_id}: {e}")
 
     except Exception as e:
-        context.log.error(f"occupancy_space_chunk_sensor error: {e}")
+        context.log.error(f"workflow_advance_sensor error: {e}")
     finally:
         session.close()

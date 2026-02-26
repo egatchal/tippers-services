@@ -4,6 +4,11 @@ import { useQueryClient } from '@tanstack/react-query';
 
 const breadcrumbMap: Record<string, string> = {
   '/pipeline': 'Snorkel Pipeline Builder',
+  '/occupancy': 'Occupancy',
+  '/datasets': 'Datasets',
+  '/jobs': 'Jobs',
+  '/models': 'Model Deployments',
+  '/workflows': 'Workflows',
   '/connections': 'Database Connections',
 };
 

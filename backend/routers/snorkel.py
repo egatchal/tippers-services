@@ -125,9 +125,10 @@ async def run_snorkel_training(
     db.commit()
     db.refresh(job)
 
-    # TODO: Trigger Dagster pipeline
+    # Trigger Dagster pipeline
     from backend.utils.dagster_client import get_dagster_client
-    
+    from backend.routers.jobs import create_unified_job
+
     run_config = {
         "ops": {
             "snorkel_training": {
@@ -137,15 +138,32 @@ async def run_snorkel_training(
             }
         }
     }
-    
+
     dagster_client = get_dagster_client()
     result = dagster_client.submit_job_execution(
         job_name="snorkel_training_pipeline",
         run_config=run_config
     )
-    
+
     job.dagster_run_id = result["run_id"]
     job.status = "RUNNING"
+
+    # Create unified job tracker entry
+    try:
+        unified_job = create_unified_job(
+            db,
+            service="snorkel",
+            job_type="snorkel_training",
+            dagster_run_id=result["run_id"],
+            dagster_job_name="snorkel_training_pipeline",
+            service_job_ref={"table": "snorkel_jobs", "id": job.job_id},
+            config=run_config,
+            status="RUNNING",
+        )
+        job.unified_job_id = unified_job.job_id
+    except Exception:
+        pass
+
     db.commit()
 
     # # Placeholder: mark as running

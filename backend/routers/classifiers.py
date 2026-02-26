@@ -96,6 +96,7 @@ async def run_classifier_training(
 
     # Trigger Dagster pipeline
     from backend.utils.dagster_client import get_dagster_client
+    from backend.routers.jobs import create_unified_job
 
     run_config = {
         "ops": {
@@ -115,6 +116,23 @@ async def run_classifier_training(
 
     job.dagster_run_id = result["run_id"]
     job.status = "RUNNING"
+
+    # Create unified job tracker entry
+    try:
+        unified_job = create_unified_job(
+            db,
+            service="snorkel",
+            job_type="classifier_training",
+            dagster_run_id=result["run_id"],
+            dagster_job_name="classifier_training_pipeline",
+            service_job_ref={"table": "classifier_jobs", "id": job.job_id},
+            config=run_config,
+            status="RUNNING",
+        )
+        job.unified_job_id = unified_job.job_id
+    except Exception:
+        pass
+
     db.commit()
 
     return job

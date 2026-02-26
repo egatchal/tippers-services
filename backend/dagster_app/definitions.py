@@ -2,7 +2,7 @@ from dagster import Definitions, load_assets_from_modules
 from backend.dagster_app import assets
 from backend.dagster_app.assets import (
     occupancy_dataset_failure_sensor,
-    occupancy_space_chunk_sensor,
+    workflow_advance_sensor,
 )
 from backend.dagster_app.resources import database_resource, s3_resource, mlflow_resource
 from backend.dagster_app.jobs import (
@@ -11,9 +11,7 @@ from backend.dagster_app.jobs import (
     materialize_feature_job,
     snorkel_training_pipeline,
     classifier_training_pipeline,
-    occupancy_dataset_job,
-    materialize_source_chunk_job,
-    materialize_derived_chunk_job,
+    occupancy_incremental_job,
 )
 
 # Load all assets (graph-based ops/graphs are not @assets so are excluded)
@@ -28,13 +26,11 @@ defs = Definitions(
         materialize_feature_job,
         snorkel_training_pipeline,
         classifier_training_pipeline,
-        occupancy_dataset_job,
-        materialize_source_chunk_job,
-        materialize_derived_chunk_job,
+        occupancy_incremental_job,
     ],
     sensors=[
         occupancy_dataset_failure_sensor,
-        occupancy_space_chunk_sensor,
+        workflow_advance_sensor,
     ],
     resources={
         "database_connection": database_resource,

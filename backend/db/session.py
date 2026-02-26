@@ -200,13 +200,410 @@ def _run_migrations(engine):
                 UNIQUE (space_id, interval_seconds, chunk_start, chunk_end)
         )
         """,
+        # ---------------------------------------------------------------
+        # Phase 1: Unified Dataset Catalog
+        # ---------------------------------------------------------------
+        """
+        CREATE TABLE IF NOT EXISTS datasets (
+            dataset_id   SERIAL PRIMARY KEY,
+            name         VARCHAR(255) NOT NULL,
+            description  TEXT,
+            service      VARCHAR(64) NOT NULL,
+            dataset_type VARCHAR(64) NOT NULL,
+            format       VARCHAR(32) DEFAULT 'parquet',
+            storage_path VARCHAR(500),
+            source_ref   JSONB,
+            row_count    INTEGER,
+            column_stats JSONB,
+            schema_info  JSONB,
+            tags         JSONB,
+            status       VARCHAR(50) DEFAULT 'AVAILABLE',
+            created_at   TIMESTAMP DEFAULT NOW(),
+            updated_at   TIMESTAMP DEFAULT NOW()
+        )
+        """,
+        # Ensure JSONB columns on datasets (fixes tables created by create_all with JSON type)
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'datasets' AND column_name = 'source_ref' AND data_type = 'json'
+            ) THEN
+                ALTER TABLE datasets
+                    ALTER COLUMN source_ref   TYPE JSONB USING source_ref::jsonb,
+                    ALTER COLUMN column_stats TYPE JSONB USING column_stats::jsonb,
+                    ALTER COLUMN schema_info  TYPE JSONB USING schema_info::jsonb,
+                    ALTER COLUMN tags         TYPE JSONB USING tags::jsonb;
+            END IF;
+        END $$
+        """,
+        # Ensure JSONB columns on jobs table
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'jobs' AND column_name = 'service_job_ref' AND data_type = 'json'
+            ) THEN
+                ALTER TABLE jobs
+                    ALTER COLUMN service_job_ref TYPE JSONB USING service_job_ref::jsonb,
+                    ALTER COLUMN config         TYPE JSONB USING config::jsonb;
+            END IF;
+        END $$
+        """,
+        # Backfill datasets from existing materialized concept_indexes
+        """
+        INSERT INTO datasets (name, service, dataset_type, format, storage_path, row_count, column_stats, source_ref, tags, status, created_at, updated_at)
+        SELECT
+            ci.name,
+            'snorkel',
+            'index',
+            'parquet',
+            ci.storage_path,
+            ci.row_count,
+            ci.column_stats::jsonb,
+            jsonb_build_object('entity_type', 'concept_index', 'entity_id', ci.index_id),
+            jsonb_build_object('concept_id', ci.c_id),
+            'AVAILABLE',
+            ci.materialized_at,
+            ci.materialized_at
+        FROM concept_indexes ci
+        WHERE ci.storage_path IS NOT NULL
+          AND ci.is_materialized = true
+          AND NOT EXISTS (
+              SELECT 1 FROM datasets d
+              WHERE d.source_ref @> jsonb_build_object('entity_type', 'concept_index', 'entity_id', ci.index_id)
+          )
+        """,
+        # Backfill datasets from existing materialized concept_rules
+        """
+        INSERT INTO datasets (name, service, dataset_type, format, storage_path, row_count, column_stats, source_ref, tags, status, created_at, updated_at)
+        SELECT
+            cr.name,
+            'snorkel',
+            'rule_features',
+            'parquet',
+            cr.storage_path,
+            cr.row_count,
+            cr.column_stats::jsonb,
+            jsonb_build_object('entity_type', 'concept_rule', 'entity_id', cr.r_id),
+            jsonb_build_object('concept_id', cr.c_id),
+            'AVAILABLE',
+            cr.materialized_at,
+            cr.materialized_at
+        FROM concept_rules cr
+        WHERE cr.storage_path IS NOT NULL
+          AND cr.is_materialized = true
+          AND NOT EXISTS (
+              SELECT 1 FROM datasets d
+              WHERE d.source_ref @> jsonb_build_object('entity_type', 'concept_rule', 'entity_id', cr.r_id)
+          )
+        """,
+        # Backfill datasets from existing materialized concept_features
+        """
+        INSERT INTO datasets (name, service, dataset_type, format, storage_path, row_count, column_stats, source_ref, tags, status, created_at, updated_at)
+        SELECT
+            cf.name,
+            'snorkel',
+            'features',
+            'parquet',
+            cf.storage_path,
+            cf.row_count,
+            cf.column_stats::jsonb,
+            jsonb_build_object('entity_type', 'concept_feature', 'entity_id', cf.feature_id),
+            jsonb_build_object('concept_id', cf.c_id),
+            'AVAILABLE',
+            cf.materialized_at,
+            cf.materialized_at
+        FROM concept_features cf
+        WHERE cf.storage_path IS NOT NULL
+          AND cf.is_materialized = true
+          AND NOT EXISTS (
+              SELECT 1 FROM datasets d
+              WHERE d.source_ref @> jsonb_build_object('entity_type', 'concept_feature', 'entity_id', cf.feature_id)
+          )
+        """,
+        # Backfill datasets from existing occupancy_datasets (only on pre-parent_dataset_id DBs)
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_datasets' AND column_name = 'parent_dataset_id'
+            ) THEN
+                INSERT INTO datasets (name, description, service, dataset_type, format, storage_path, row_count, column_stats, source_ref, tags, status, created_at, updated_at)
+                SELECT
+                    od.name,
+                    od.description,
+                    'occupancy',
+                    'occupancy_timeseries',
+                    'parquet',
+                    od.storage_path,
+                    od.row_count,
+                    od.column_stats::jsonb,
+                    jsonb_build_object('entity_type', 'occupancy_dataset', 'entity_id', od.dataset_id),
+                    jsonb_build_object('space_id', od.root_space_id),
+                    'AVAILABLE',
+                    od.created_at,
+                    COALESCE(od.completed_at, od.created_at)
+                FROM occupancy_datasets od
+                WHERE od.storage_path IS NOT NULL
+                  AND od.status = 'COMPLETED'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM datasets d
+                      WHERE d.source_ref @> jsonb_build_object('entity_type', 'occupancy_dataset', 'entity_id', od.dataset_id)
+                  );
+            END IF;
+        END $$
+        """,
+        # Backfill datasets from completed per-space occupancy chunks (only on pre-parent_dataset_id DBs)
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_space_chunks' AND column_name = 'parent_dataset_id'
+            ) THEN
+                INSERT INTO datasets (name, service, dataset_type, format, storage_path, source_ref, tags, status, created_at, updated_at)
+                SELECT
+                    'Occupancy space ' || c.space_id || ' (' || c.interval_seconds || 's)',
+                    'occupancy',
+                    'occupancy_space_chunk',
+                    'parquet',
+                    c.storage_path,
+                    jsonb_build_object('entity_type', 'occupancy_space_chunk', 'space_id', c.space_id, 'interval_seconds', c.interval_seconds),
+                    jsonb_build_object('space_id', c.space_id, 'interval_seconds', c.interval_seconds, 'space_type', c.space_type),
+                    'AVAILABLE',
+                    c.completed_at,
+                    c.completed_at
+                FROM occupancy_space_chunks c
+                WHERE c.status = 'COMPLETED'
+                  AND c.storage_path IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM datasets d
+                      WHERE d.source_ref @> jsonb_build_object('entity_type', 'occupancy_space_chunk', 'space_id', c.space_id, 'interval_seconds', c.interval_seconds)
+                        AND d.storage_path = c.storage_path
+                  );
+            END IF;
+        END $$
+        """,
+        # ---------------------------------------------------------------
+        # Phase 2: Unified Job Tracker
+        # ---------------------------------------------------------------
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id             SERIAL PRIMARY KEY,
+            service            VARCHAR(64) NOT NULL,
+            job_type           VARCHAR(64) NOT NULL,
+            service_job_ref    JSONB,
+            dagster_run_id     VARCHAR(255),
+            dagster_job_name   VARCHAR(255),
+            config             JSONB,
+            status             VARCHAR(50) DEFAULT 'PENDING',
+            error_message      TEXT,
+            input_dataset_ids  INTEGER[],
+            output_dataset_ids INTEGER[],
+            created_at         TIMESTAMP DEFAULT NOW(),
+            started_at         TIMESTAMP,
+            completed_at       TIMESTAMP
+        )
+        """,
+        # Add unified_job_id FK columns to existing job tables
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'snorkel_jobs' AND column_name = 'unified_job_id'
+            ) THEN
+                ALTER TABLE snorkel_jobs ADD COLUMN unified_job_id INTEGER REFERENCES jobs(job_id);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'classifier_jobs' AND column_name = 'unified_job_id'
+            ) THEN
+                ALTER TABLE classifier_jobs ADD COLUMN unified_job_id INTEGER REFERENCES jobs(job_id);
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_datasets' AND column_name = 'unified_job_id'
+            ) THEN
+                ALTER TABLE occupancy_datasets ADD COLUMN unified_job_id INTEGER REFERENCES jobs(job_id);
+            END IF;
+        END $$;
+        """,
+        # ---------------------------------------------------------------
+        # Phase 3: Service Deployments
+        # ---------------------------------------------------------------
+        """
+        CREATE TABLE IF NOT EXISTS service_deployments (
+            deployment_id    SERIAL PRIMARY KEY,
+            model_id         INTEGER REFERENCES hosted_models(model_id),
+            model_version_id INTEGER REFERENCES hosted_model_versions(model_version_id),
+            service          VARCHAR(64) NOT NULL,
+            status           VARCHAR(32) DEFAULT 'ACTIVE',
+            deploy_config    JSONB,
+            mlflow_model_uri VARCHAR(500),
+            created_at       TIMESTAMP DEFAULT NOW(),
+            updated_at       TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT uq_service_deployment_service_model UNIQUE (service, model_id)
+        )
+        """,
+        # ---------------------------------------------------------------
+        # Phase 4: Workflow Engine
+        # ---------------------------------------------------------------
+        """
+        CREATE TABLE IF NOT EXISTS workflow_templates (
+            template_id SERIAL PRIMARY KEY,
+            name        VARCHAR(255) NOT NULL,
+            service     VARCHAR(64) NOT NULL,
+            description TEXT,
+            steps       JSONB NOT NULL,
+            is_active   BOOLEAN DEFAULT true,
+            created_at  TIMESTAMP DEFAULT NOW(),
+            updated_at  TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT uq_workflow_template_service_name UNIQUE (service, name)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS workflow_runs (
+            run_id        SERIAL PRIMARY KEY,
+            template_id   INTEGER REFERENCES workflow_templates(template_id),
+            service       VARCHAR(64) NOT NULL,
+            params        JSONB,
+            step_statuses JSONB,
+            status        VARCHAR(50) DEFAULT 'PENDING',
+            error_message TEXT,
+            created_at    TIMESTAMP DEFAULT NOW(),
+            completed_at  TIMESTAMP
+        )
+        """,
+        # Seed workflow templates (idempotent via ON CONFLICT)
+        """
+        INSERT INTO workflow_templates (name, service, description, steps)
+        VALUES (
+            'Snorkel Full Pipeline',
+            'snorkel',
+            'Full weak supervision pipeline: materialize index -> materialize rules -> Snorkel training -> classifier training',
+            '{"steps": [
+                {"key": "materialize_index", "dagster_job": "materialize_index_job",
+                 "config_template": {"ops": {"materialized_index": {"config": {"index_id": "{{index_id}}"}}}},
+                 "depends_on": []},
+                {"key": "materialize_rules", "dagster_job": "materialize_rule_job",
+                 "config_template": {"ops": {"materialized_rule": {"config": {"rule_id": "{{rule_id}}"}}}},
+                 "depends_on": ["materialize_index"]},
+                {"key": "snorkel_train", "dagster_job": "snorkel_training_pipeline",
+                 "config_template": {"ops": {"snorkel_training": {"config": {"job_id": "{{snorkel_job_id}}"}}}},
+                 "depends_on": ["materialize_rules"]},
+                {"key": "classifier_train", "dagster_job": "classifier_training_pipeline",
+                 "config_template": {"ops": {"classifier_training": {"config": {"job_id": "{{classifier_job_id}}"}}}},
+                 "depends_on": ["snorkel_train"]}
+            ]}'::jsonb
+        )
+        ON CONFLICT (service, name) DO NOTHING
+        """,
+        """
+        INSERT INTO workflow_templates (name, service, description, steps)
+        VALUES (
+            'Occupancy Dataset',
+            'occupancy',
+            'Create occupancy dataset from WiFi session data',
+            '{"steps": [
+                {"key": "create_dataset", "dagster_job": "occupancy_dataset_job",
+                 "config_template": {"ops": {"plan_occupancy_chunks": {"config": {"dataset_id": "{{dataset_id}}"}}}},
+                 "depends_on": []}
+            ]}'::jsonb
+        )
+        ON CONFLICT (service, name) DO NOTHING
+        """,
+        # ---------------------------------------------------------------
+        # Stale record cleanup (runs every startup)
+        # ---------------------------------------------------------------
+        # Auto-clean stale occupancy_space_chunks older than 24 hours
+        """
+        DELETE FROM occupancy_space_chunks
+        WHERE status IN ('PENDING', 'FAILED', 'RUNNING')
+          AND created_at < NOW() - INTERVAL '24 hours'
+        """,
+        # Mark stale jobs as FAILED
+        """
+        UPDATE jobs
+        SET status = 'FAILED', error_message = 'Auto-cleaned: stale record'
+        WHERE status IN ('PENDING', 'RUNNING')
+          AND created_at < NOW() - INTERVAL '24 hours'
+        """,
+        # Mark stale occupancy_datasets as FAILED
+        """
+        UPDATE occupancy_datasets
+        SET status = 'FAILED', error_message = 'Auto-cleaned: stale record'
+        WHERE status IN ('PENDING', 'RUNNING')
+          AND created_at < NOW() - INTERVAL '24 hours'
+        """,
+        # ---------------------------------------------------------------
+        # Consolidate occupancy_datasets under datasets (parent FK)
+        # ---------------------------------------------------------------
+        # Add parent_dataset_id FK to occupancy_datasets
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_datasets' AND column_name = 'parent_dataset_id'
+            ) THEN
+                ALTER TABLE occupancy_datasets
+                ADD COLUMN parent_dataset_id INTEGER REFERENCES datasets(dataset_id);
+            END IF;
+        END $$;
+        """,
+        # Add parent_dataset_id FK to occupancy_space_chunks
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'occupancy_space_chunks' AND column_name = 'parent_dataset_id'
+            ) THEN
+                ALTER TABLE occupancy_space_chunks
+                ADD COLUMN parent_dataset_id INTEGER REFERENCES datasets(dataset_id);
+            END IF;
+        END $$;
+        """,
+        # Backfill: link completed occupancy_datasets to their matching datasets rows
+        """
+        UPDATE occupancy_datasets od
+        SET parent_dataset_id = d.dataset_id
+        FROM datasets d
+        WHERE od.parent_dataset_id IS NULL
+          AND od.status = 'COMPLETED'
+          AND d.source_ref @> jsonb_build_object('entity_type', 'occupancy_dataset', 'entity_id', od.dataset_id)
+        """,
+        # Backfill: link completed occupancy_space_chunks to their matching datasets rows
+        """
+        UPDATE occupancy_space_chunks c
+        SET parent_dataset_id = d.dataset_id
+        FROM datasets d
+        WHERE c.parent_dataset_id IS NULL
+          AND c.status = 'COMPLETED'
+          AND d.source_ref @> jsonb_build_object('entity_type', 'occupancy_space_chunk', 'space_id', c.space_id, 'interval_seconds', c.interval_seconds)
+          AND d.storage_path = c.storage_path
+        """,
     ]
 
-    try:
-        with engine.connect() as conn:
-            for sql in migrations:
+    for i, sql in enumerate(migrations):
+        try:
+            with engine.connect() as conn:
                 conn.execute(text(sql))
-            conn.commit()
-        logger.info("Schema migrations completed successfully.")
-    except Exception as e:
-        logger.warning(f"Schema migration warning: {e}")
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Schema migration step {i} warning: {e}")

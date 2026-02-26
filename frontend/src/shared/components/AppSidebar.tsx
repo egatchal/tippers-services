@@ -1,9 +1,14 @@
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Workflow, Database, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { Workflow, Database, FolderOpen, ListTodo, Rocket, GitBranch, Activity, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 
 const navItems = [
-  { label: 'Snorkel Pipeline Builder', path: '/pipeline', icon: Workflow },
+  { label: 'Pipeline Builder', path: '/pipeline', icon: Workflow },
+  { label: 'Occupancy', path: '/occupancy', icon: Activity },
+  { label: 'Datasets', path: '/datasets', icon: FolderOpen },
+  { label: 'Jobs', path: '/jobs', icon: ListTodo },
+  { label: 'Models', path: '/models', icon: Rocket },
+  { label: 'Workflows', path: '/workflows', icon: GitBranch },
   { label: 'Connections', path: '/connections', icon: Database },
 ];
 

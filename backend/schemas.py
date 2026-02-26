@@ -499,6 +499,7 @@ class OccupancySpaceChunkResponse(BaseModel):
     storage_path: Optional[str]
     dagster_run_id: Optional[str]
     error_message: Optional[str]
+    parent_dataset_id: Optional[int] = None
     created_at: datetime
     completed_at: Optional[datetime]
 
@@ -514,7 +515,7 @@ class OccupancyDatasetCreate(BaseModel):
     start_time: Optional[datetime] = None   # None → auto-resolve from data
     end_time: Optional[datetime] = None     # None → auto-resolve from data
     interval_seconds: int = 3600            # Must be in ALLOWED_INTERVALS
-    chunk_days: Optional[int] = 7
+    force_overwrite: bool = False           # Force recompute, discard existing parquets
 
 
 class OccupancyDatasetResponse(BaseModel):
@@ -532,6 +533,179 @@ class OccupancyDatasetResponse(BaseModel):
     storage_path: Optional[str]
     row_count: Optional[int]
     column_stats: Optional[Dict[str, Any]]
+    error_message: Optional[str]
+    parent_dataset_id: Optional[int] = None
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+# ============================================================================
+# Unified Dataset Catalog Schemas (Phase 1)
+# ============================================================================
+
+class DatasetCreate(BaseModel):
+    """Schema for registering a dataset in the unified catalog."""
+    name: str
+    description: Optional[str] = None
+    service: str
+    dataset_type: str
+    format: str = "parquet"
+    storage_path: Optional[str] = None
+    source_ref: Optional[Dict[str, Any]] = None
+    row_count: Optional[int] = None
+    column_stats: Optional[Dict[str, Any]] = None
+    schema_info: Optional[Dict[str, Any]] = None
+    tags: Optional[Dict[str, Any]] = None
+
+
+class DatasetResponse(BaseModel):
+    """Schema for dataset catalog response."""
+    dataset_id: int
+    name: str
+    description: Optional[str]
+    service: str
+    dataset_type: str
+    format: str
+    storage_path: Optional[str]
+    source_ref: Optional[Dict[str, Any]]
+    row_count: Optional[int]
+    column_stats: Optional[Dict[str, Any]]
+    schema_info: Optional[Dict[str, Any]]
+    tags: Optional[Dict[str, Any]]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DatasetPreviewResponse(BaseModel):
+    """Schema for dataset preview (first N rows)."""
+    dataset_id: int
+    row_count: int
+    columns: List[str]
+    rows: List[Dict[str, Any]]
+
+
+# ============================================================================
+# Unified Job Tracker Schemas (Phase 2)
+# ============================================================================
+
+class JobResponse(BaseModel):
+    """Schema for unified job response."""
+    job_id: int
+    service: str
+    job_type: str
+    service_job_ref: Optional[Dict[str, Any]]
+    dagster_run_id: Optional[str]
+    dagster_job_name: Optional[str]
+    config: Optional[Dict[str, Any]]
+    status: str
+    error_message: Optional[str]
+    input_dataset_ids: Optional[List[int]]
+    output_dataset_ids: Optional[List[int]]
+    created_at: datetime
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+# ============================================================================
+# Model Serving Schemas (Phase 3)
+# ============================================================================
+
+class DeploymentCreate(BaseModel):
+    """Schema for deploying a model version to a service."""
+    model_id: int
+    model_version_id: int
+    service: str
+    deploy_config: Optional[Dict[str, Any]] = None
+    mlflow_model_uri: Optional[str] = None
+
+
+class DeploymentResponse(BaseModel):
+    """Schema for deployment response."""
+    deployment_id: int
+    model_id: int
+    model_version_id: int
+    service: str
+    status: str
+    deploy_config: Optional[Dict[str, Any]]
+    mlflow_model_uri: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PredictRequest(BaseModel):
+    """Schema for real-time prediction request."""
+    instances: List[Dict[str, Any]]
+
+
+class PredictResponse(BaseModel):
+    """Schema for prediction response."""
+    deployment_id: int
+    model_name: str
+    model_version: int
+    predictions: List[Any]
+    prediction_probs: Optional[List[List[float]]] = None
+
+
+class BatchInferenceRequest(BaseModel):
+    """Schema for batch inference on a dataset."""
+    deployment_id: int
+    output_name: Optional[str] = None
+
+
+# ============================================================================
+# Workflow Engine Schemas (Phase 4)
+# ============================================================================
+
+class WorkflowTemplateCreate(BaseModel):
+    """Schema for creating a workflow template."""
+    name: str
+    service: str
+    description: Optional[str] = None
+    steps: Dict[str, Any]
+
+
+class WorkflowTemplateResponse(BaseModel):
+    """Schema for workflow template response."""
+    template_id: int
+    name: str
+    service: str
+    description: Optional[str]
+    steps: Dict[str, Any]
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WorkflowRunRequest(BaseModel):
+    """Schema for executing a workflow template."""
+    template_id: int
+    params: Optional[Dict[str, Any]] = None
+
+
+class WorkflowRunResponse(BaseModel):
+    """Schema for workflow run response."""
+    run_id: int
+    template_id: int
+    service: str
+    params: Optional[Dict[str, Any]]
+    step_statuses: Optional[Dict[str, Any]]
+    status: str
     error_message: Optional[str]
     created_at: datetime
     completed_at: Optional[datetime]

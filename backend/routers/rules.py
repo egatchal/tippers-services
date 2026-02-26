@@ -305,6 +305,7 @@ async def materialize_rule(
 
     # Trigger Dagster job
     from backend.utils.dagster_client import get_dagster_client
+    from backend.routers.jobs import create_unified_job
 
     try:
         run_config = {
@@ -322,6 +323,22 @@ async def materialize_rule(
             job_name="materialize_rule_job",
             run_config=run_config
         )
+
+        # Create unified job tracker entry
+        try:
+            create_unified_job(
+                db,
+                service="snorkel",
+                job_type="materialize_rule",
+                dagster_run_id=result["run_id"],
+                dagster_job_name="materialize_rule_job",
+                service_job_ref={"entity_type": "concept_rule", "entity_id": r_id},
+                config=run_config,
+                status="RUNNING",
+            )
+            db.commit()
+        except Exception:
+            pass
 
         return RuleMaterializeResponse(
             r_id=r_id,

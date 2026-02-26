@@ -40,3 +40,22 @@ export const statusLabel: Record<NodeStatus, string> = {
   stale: 'Stale',
   default: 'Not Materialized',
 };
+
+// --- Unified platform service statuses ---
+
+export type ServiceStatus =
+  | 'COMPLETED' | 'RUNNING' | 'PENDING' | 'FAILED' | 'CANCELLED'
+  | 'ACTIVE' | 'INACTIVE' | 'AVAILABLE' | 'STALE' | 'DELETED';
+
+export const serviceStatusBgClass: Record<ServiceStatus, string> = {
+  COMPLETED: 'bg-green-100 text-green-800',
+  ACTIVE: 'bg-green-100 text-green-800',
+  AVAILABLE: 'bg-green-100 text-green-800',
+  RUNNING: 'bg-amber-100 text-amber-800',
+  PENDING: 'bg-yellow-100 text-yellow-800',
+  FAILED: 'bg-red-100 text-red-800',
+  CANCELLED: 'bg-gray-100 text-gray-600',
+  INACTIVE: 'bg-gray-100 text-gray-600',
+  STALE: 'bg-orange-100 text-orange-800',
+  DELETED: 'bg-red-50 text-red-400',
+};

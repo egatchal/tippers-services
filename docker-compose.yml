@@ -12,6 +12,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -139,7 +140,7 @@ services:
       dockerfile: Dockerfile
     container_name: tippers-mlflow
     environment:
-      - MLFLOW_BACKEND_STORE_URI=postgresql://postgres:postgres@postgres:5432/tippers
+      - MLFLOW_BACKEND_STORE_URI=postgresql://postgres:postgres@postgres:5432/mlflow
       - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
       - MLFLOW_HOST=mlflow:5000
     ports:
@@ -153,7 +154,7 @@ services:
       mlflow server
       --host 0.0.0.0
       --port 5000
-      --backend-store-uri postgresql://postgres:postgres@postgres:5432/tippers
+      --backend-store-uri postgresql://postgres:postgres@postgres:5432/mlflow
       --default-artifact-root /mlflow/artifacts
       --allowed-hosts "mlflow,mlflow:5000,localhost,127.0.0.1"
 

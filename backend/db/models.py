@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, Boolean, Text, TIMESTAMP, ARRAY, JSON, Float, ForeignKey, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from backend.db.session import Base
@@ -143,17 +144,13 @@ class SnorkelJob(Base):
 
     # Snorkel configuration
     config = Column(JSON, nullable=True)
-    # Example: {
-    #   "learning_rate": 0.01,
-    #   "epochs": 100,
-    #   "class_balance": [0.3, 0.4, 0.3]
-    # }
 
     output_type = Column(String(50), default='hard_labels')
     dagster_run_id = Column(String(255), nullable=True)
     status = Column(String(50), default='PENDING')
     result_path = Column(String(500), nullable=True)
     error_message = Column(Text, nullable=True)
+    unified_job_id = Column(Integer, ForeignKey('jobs.job_id'), nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     completed_at = Column(TIMESTAMP, nullable=True)
@@ -199,6 +196,7 @@ class ClassifierJob(Base):
     status = Column(String(50), default='PENDING')
     result_path = Column(String(500), nullable=True)
     error_message = Column(Text, nullable=True)
+    unified_job_id = Column(Integer, ForeignKey('jobs.job_id'), nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     completed_at = Column(TIMESTAMP, nullable=True)
@@ -221,8 +219,12 @@ class OccupancyDataset(Base):
     row_count        = Column(Integer, nullable=True)
     column_stats     = Column(JSON, nullable=True)
     error_message    = Column(Text, nullable=True)
+    unified_job_id   = Column(Integer, ForeignKey('jobs.job_id'), nullable=True)
+    parent_dataset_id = Column(Integer, ForeignKey('datasets.dataset_id'), nullable=True)
     created_at       = Column(TIMESTAMP, server_default=func.now())
     completed_at     = Column(TIMESTAMP, nullable=True)
+
+    parent_dataset = relationship("Dataset", foreign_keys=[parent_dataset_id])
 
 
 class OccupancySpaceChunk(Base):
@@ -244,6 +246,7 @@ class OccupancySpaceChunk(Base):
     storage_path     = Column(String(500), nullable=True)
     dagster_run_id   = Column(String(255), nullable=True)
     error_message    = Column(Text, nullable=True)
+    parent_dataset_id = Column(Integer, ForeignKey('datasets.dataset_id'), nullable=True)
     created_at       = Column(TIMESTAMP, server_default=func.now())
     completed_at     = Column(TIMESTAMP, nullable=True)
 
@@ -320,3 +323,100 @@ class HostedModelVersion(Base):
     __table_args__ = (
         UniqueConstraint("model_id", "mlflow_version", name="uq_hosted_model_versions_model_mlflow_version"),
     )
+
+
+# ============================================================================
+# Unified Platform Models (Phases 1-4)
+# ============================================================================
+
+class Dataset(Base):
+    """Unified dataset catalog — one row per data artifact across all services."""
+    __tablename__ = "datasets"
+
+    dataset_id   = Column(Integer, primary_key=True, autoincrement=True)
+    name         = Column(String(255), nullable=False)
+    description  = Column(Text, nullable=True)
+    service      = Column(String(64), nullable=False)       # snorkel, occupancy, hvac, general
+    dataset_type = Column(String(64), nullable=False)       # index, rule_features, features, labels, training, predictions, occupancy_timeseries
+    format       = Column(String(32), default='parquet')
+    storage_path = Column(String(500), nullable=True)
+    source_ref   = Column(JSONB, nullable=True)              # {"entity_type": "concept_index", "entity_id": 5}
+    row_count    = Column(Integer, nullable=True)
+    column_stats = Column(JSONB, nullable=True)
+    schema_info  = Column(JSONB, nullable=True)              # column names + dtypes
+    tags         = Column(JSONB, nullable=True)              # arbitrary filtering: {"concept_id": 1, "space_id": 42}
+    status       = Column(String(50), default='AVAILABLE')  # AVAILABLE / STALE / DELETED
+    created_at   = Column(TIMESTAMP, server_default=func.now())
+    updated_at   = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class Job(Base):
+    """Unified job tracker — cross-service job visibility."""
+    __tablename__ = "jobs"
+
+    job_id            = Column(Integer, primary_key=True, autoincrement=True)
+    service           = Column(String(64), nullable=False)       # snorkel, occupancy, hvac
+    job_type          = Column(String(64), nullable=False)       # materialize_index, snorkel_training, source_chunk, etc.
+    service_job_ref   = Column(JSONB, nullable=True)              # {"table": "snorkel_jobs", "id": 5}
+    dagster_run_id    = Column(String(255), nullable=True)
+    dagster_job_name  = Column(String(255), nullable=True)
+    config            = Column(JSONB, nullable=True)
+    status            = Column(String(50), default='PENDING')    # PENDING / RUNNING / COMPLETED / FAILED / CANCELLED
+    error_message     = Column(Text, nullable=True)
+    input_dataset_ids  = Column(ARRAY(Integer), nullable=True)
+    output_dataset_ids = Column(ARRAY(Integer), nullable=True)
+    created_at        = Column(TIMESTAMP, server_default=func.now())
+    started_at        = Column(TIMESTAMP, nullable=True)
+    completed_at      = Column(TIMESTAMP, nullable=True)
+
+
+class ServiceDeployment(Base):
+    """Model deployment directory — maps a model version to a service for inference."""
+    __tablename__ = "service_deployments"
+
+    deployment_id    = Column(Integer, primary_key=True, autoincrement=True)
+    model_id         = Column(Integer, ForeignKey('hosted_models.model_id'), nullable=False)
+    model_version_id = Column(Integer, ForeignKey('hosted_model_versions.model_version_id'), nullable=False)
+    service          = Column(String(64), nullable=False)        # occupancy, snorkel, hvac
+    status           = Column(String(32), default='ACTIVE')      # ACTIVE / INACTIVE / FAILED
+    deploy_config    = Column(JSON, nullable=True)               # preprocessing config, batch size, etc.
+    mlflow_model_uri = Column(String(500), nullable=True)        # models:/OccModel/3
+    created_at       = Column(TIMESTAMP, server_default=func.now())
+    updated_at       = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('service', 'model_id', name='uq_service_deployment_service_model'),
+    )
+
+
+class WorkflowTemplate(Base):
+    """Reusable DAG workflow definition — steps map to Dagster jobs."""
+    __tablename__ = "workflow_templates"
+
+    template_id = Column(Integer, primary_key=True, autoincrement=True)
+    name        = Column(String(255), nullable=False)
+    service     = Column(String(64), nullable=False)
+    description = Column(Text, nullable=True)
+    steps       = Column(JSON, nullable=False)                   # step DAG definition
+    is_active   = Column(Boolean, default=True)
+    created_at  = Column(TIMESTAMP, server_default=func.now())
+    updated_at  = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('service', 'name', name='uq_workflow_template_service_name'),
+    )
+
+
+class WorkflowRun(Base):
+    """Execution instance of a workflow template."""
+    __tablename__ = "workflow_runs"
+
+    run_id        = Column(Integer, primary_key=True, autoincrement=True)
+    template_id   = Column(Integer, ForeignKey('workflow_templates.template_id'), nullable=False)
+    service       = Column(String(64), nullable=False)
+    params        = Column(JSON, nullable=True)                  # runtime values for {{placeholders}}
+    step_statuses = Column(JSON, nullable=True)                  # {"step_key": {"status": "...", "dagster_run_id": "..."}}
+    status        = Column(String(50), default='PENDING')
+    error_message = Column(Text, nullable=True)
+    created_at    = Column(TIMESTAMP, server_default=func.now())
+    completed_at  = Column(TIMESTAMP, nullable=True)

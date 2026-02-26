@@ -26,6 +26,19 @@ def _row_to_space(row) -> SpaceResponse:
     )
 
 
+@router.get("/roots", response_model=List[SpaceResponse])
+def list_root_spaces():
+    """Return top-level spaces (buildings) where parent_space_id IS NULL."""
+    engine = get_tippers_engine()
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT space_id, space_name, parent_space_id, building_room
+            FROM space WHERE parent_space_id IS NULL
+            ORDER BY space_name
+        """))
+        return [_row_to_space(r) for r in result.fetchall()]
+
+
 @router.get("", response_model=List[SpaceResponse])
 def list_spaces(
     search: Optional[str] = None,
