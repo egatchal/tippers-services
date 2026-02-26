@@ -212,7 +212,7 @@ class OccupancyDataset(Base):
     start_time       = Column(TIMESTAMP, nullable=False)
     end_time         = Column(TIMESTAMP, nullable=False)
     interval_seconds = Column(Integer, nullable=False)
-    chunk_days       = Column(Integer, nullable=True)
+    # chunk_days removed - always use 1-day chunks (migration: ALTER TABLE occupancy_datasets DROP COLUMN chunk_days)
     status           = Column(String(50), default='PENDING')
     dagster_run_id   = Column(String(255), nullable=True)
     storage_path     = Column(String(500), nullable=True)
@@ -249,6 +249,8 @@ class OccupancySpaceChunk(Base):
     parent_dataset_id = Column(Integer, ForeignKey('datasets.dataset_id'), nullable=True)
     created_at       = Column(TIMESTAMP, server_default=func.now())
     completed_at     = Column(TIMESTAMP, nullable=True)
+    retry_count      = Column(Integer, default=0, nullable=False)
+    timeout_seconds  = Column(Integer, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -256,6 +258,35 @@ class OccupancySpaceChunk(Base):
             name='uq_occupancy_space_chunk'
         ),
     )
+
+
+class OccupancyModelJob(Base):
+    """Occupancy model training jobs - trains Prophet or Transformer models."""
+    __tablename__ = "occupancy_model_jobs"
+
+    job_id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_id = Column(Integer, ForeignKey('occupancy_datasets.dataset_id'), nullable=False)
+    space_id = Column(Integer, nullable=False)
+    model_type = Column(String(50), nullable=False)  # 'prophet' or 'transformer'
+
+    # Hyperparameters (defaults from notebooks, user can override)
+    config = Column(JSON, nullable=True)
+
+    # MLflow integration
+    mlflow_run_id = Column(String(255), nullable=True)
+    mlflow_model_name = Column(String(255), nullable=True)
+    mlflow_model_version = Column(Integer, nullable=True)
+
+    # Job tracking
+    dagster_run_id = Column(String(255), nullable=True)
+    status = Column(String(50), default='PENDING')  # PENDING/RUNNING/COMPLETED/FAILED
+
+    # Metrics (logged after training)
+    metrics = Column(JSON, nullable=True)  # {"rmse": 1.23, "mae": 0.98, ...}
+
+    error_message = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    completed_at = Column(TIMESTAMP, nullable=True)
 
 
 class HostedModel(Base):

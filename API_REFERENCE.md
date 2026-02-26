@@ -1294,17 +1294,19 @@ Compute space occupancy over time from WiFi session data using **bottom-up per-s
 
 **How it works:**
 
-`POST /occupancy/datasets` returns immediately. Computation proceeds asynchronously in three phases:
+`POST /occupancy/datasets` returns **instantly** (<1 second) after creating database records. Computation proceeds asynchronously in four phases:
 
-1. **Space discovery** _(synchronous, in the request)_ — Walks the space subtree via recursive CTE. Identifies **source spaces** (rooms whose `space_id` appears in `user_ap_trajectory` within the time range) and **derived spaces** (their ancestors in the hierarchy: floors, buildings). Computes epoch-aligned chunk windows of `chunk_days` days.
+1. **Space discovery** _(synchronous, in the request)_ — Walks the space subtree via recursive CTE. Identifies **source spaces** (rooms whose `space_id` appears in `user_ap_trajectory` within the time range) and **derived spaces** (their ancestors in the hierarchy: floors, buildings). Computes epoch-aligned chunk windows of `chunk_days` days. Creates `OccupancySpaceChunk` records with status `PENDING`.
 
-2. **Source chunk jobs** _(parallel Dagster runs)_ — One `materialize_source_chunk_job` run per `(source_space_id, chunk_window)`. Each run executes SQL against tippers to count `DISTINCT mac_address` per interval bin and uploads a sparse Parquet to:
+2. **Job submission** _(background sensor)_ — The `source_chunk_submission_sensor` runs every 30 seconds (configurable via `SOURCE_CHUNK_SENSOR_INTERVAL`). It finds PENDING source chunks with no `dagster_run_id` and submits up to 100 Dagster jobs per iteration.
+
+3. **Source chunk jobs** _(parallel Dagster runs)_ — One `materialize_source_chunk_job` run per `(source_space_id, chunk_window)`. Up to 16 jobs run concurrently (configurable in `dagster_home/dagster.yaml`). Each run executes SQL against tippers to count `DISTINCT mac_address` per interval bin and uploads a sparse Parquet to:
    ```
    s3://bucket/occupancy/spaces/{space_id}/{interval_seconds}/chunk_{start}_{end}.parquet
    ```
    Columns: `interval_begin_time`, `number_connections`. Empty bins are not stored.
 
-3. **Derived chunk jobs** _(triggered by sensor)_ — The `occupancy_space_chunk_sensor` polls every 30 seconds. When all children of a derived space have COMPLETED chunks for a window, it submits `materialize_derived_chunk_job`, which sums child parquets by `interval_begin_time`. Floors complete before buildings (bottom-up).
+4. **Derived chunk jobs** _(triggered by sensor)_ — The `occupancy_space_chunk_sensor` polls every 30 seconds. When all children of a derived space have COMPLETED chunks for a window, it submits `materialize_derived_chunk_job`, which sums child parquets by `interval_begin_time`. Floors complete before buildings (bottom-up).
 
 **Chunk reuse:** Chunks are keyed by `(space_id, interval_seconds, chunk_start, chunk_end)`. A COMPLETED chunk is never re-run — `POST /occupancy/datasets` with a wider time range only triggers the new, uncovered windows.
 
@@ -1371,7 +1373,9 @@ POST /occupancy/datasets
 }
 ```
 
-`dagster_run_id` is `null` because the new system submits many Dagster runs (one per source chunk), not a single run.
+**Response time:** <1 second. The API returns immediately after creating the dataset and chunk records. Job submission happens asynchronously via the `source_chunk_submission_sensor`.
+
+`dagster_run_id` is `null` because the system submits many Dagster runs (one per source chunk), not a single run. To track progress, use `GET /occupancy/datasets/{dataset_id}/results?space_id=X` which shows `completed_chunks` / `total_chunks`.
 
 ### List Occupancy Datasets
 ```http
@@ -1943,6 +1947,54 @@ Once the server is running:
 
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+---
+
+## Configuration
+
+### Dagster Concurrent Run Limits
+
+The occupancy dataset system uses Dagster's `QueuedRunCoordinator` to manage concurrent job execution. By default, up to **16 concurrent runs** can execute simultaneously.
+
+**Configuration file:** `dagster_home/dagster.yaml`
+
+```yaml
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 16  # Adjust this value
+```
+
+**To change the concurrent run limit:**
+
+1. Edit `dagster_home/dagster.yaml` and modify `max_concurrent_runs`
+2. Restart Dagster services:
+   ```bash
+   docker-compose restart dagster-daemon dagster-webserver
+   ```
+
+**Environment variables (.env):**
+
+```env
+# Dagster Configuration
+DAGSTER_HOST=dagster-webserver
+DAGSTER_PORT=3000
+DAGSTER_MAX_CONCURRENT=16  # Worker processes per job
+
+# Occupancy Sensor Configuration
+SOURCE_CHUNK_SENSOR_INTERVAL=30  # Job submission sensor interval (seconds)
+CHUNK_TIMEOUT_MULTIPLIER=2.0
+CHUNK_TIMEOUT_MIN_SECONDS=300
+CHUNK_TIMEOUT_LOOKBACK_DAYS=30
+```
+
+**Performance tuning:**
+
+- **`max_concurrent_runs`**: Number of Dagster jobs running simultaneously
+- **`DAGSTER_MAX_CONCURRENT`**: Number of worker processes each job can spawn
+- **Total parallelism** = `max_concurrent_runs` × `DAGSTER_MAX_CONCURRENT` workers
+- Monitor system resources and database connection pool limits when increasing these values
 
 ---
 

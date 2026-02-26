@@ -121,6 +121,55 @@ class DagsterClient:
         else:
             raise Exception(f"Run not found: {run_data}")
 
+    def terminate_run(self, run_id: str) -> Dict[str, Any]:
+        """Terminate a running Dagster job."""
+        mutation = """
+        mutation TerminateRun($runId: String!) {
+          terminateRun(runId: $runId) {
+            __typename
+            ... on TerminateRunSuccess {
+              run {
+                runId
+                status
+              }
+            }
+            ... on RunNotFoundError {
+              message
+            }
+            ... on PythonError {
+              message
+              stack
+            }
+          }
+        }
+        """
+
+        variables = {"runId": run_id}
+
+        response = httpx.post(
+            self.base_url,
+            json={"query": mutation, "variables": variables},
+            timeout=30.0
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            raise Exception(f"GraphQL error: {data['errors']}")
+
+        terminate_result = data["data"]["terminateRun"]
+
+        if terminate_result["__typename"] == "TerminateRunSuccess":
+            return {
+                "run_id": terminate_result["run"]["runId"],
+                "status": terminate_result["run"]["status"]
+            }
+        elif terminate_result["__typename"] == "RunNotFoundError":
+            raise Exception(f"Run not found: {terminate_result['message']}")
+        else:
+            raise Exception(f"Failed to terminate run: {terminate_result}")
+
 
 # Singleton instance
 _dagster_client = None
