@@ -16,9 +16,7 @@ export function usePollJobs(cId: number | null) {
     const interval = setInterval(() => {
       queryClient.invalidateQueries({ queryKey: ['indexes', cId] });
       queryClient.invalidateQueries({ queryKey: ['rules', cId] });
-      queryClient.invalidateQueries({ queryKey: ['features', cId] });
       queryClient.invalidateQueries({ queryKey: ['snorkelJobs', cId] });
-      queryClient.invalidateQueries({ queryKey: ['classifierJobs', cId] });
     }, POLL_INTERVAL);
     return () => clearInterval(interval);
   }, [hasRunning, cId, queryClient]);

@@ -1,8 +1,8 @@
 import type { Node } from '@xyflow/react';
-import type { Index, Rule, Feature, LabelingFunction, SnorkelJob, ClassifierJob, ConceptValue } from './entities';
+import type { Index, Rule, LabelingFunction, SnorkelJob, ConceptValue } from './entities';
 import type { NodeStatus } from '../../../shared/utils/statusColors';
 
-export type PipelineNodeType = 'index' | 'rule' | 'feature' | 'lf' | 'snorkel' | 'classifier' | 'cv';
+export type PipelineNodeType = 'index' | 'rule' | 'lf' | 'snorkel' | 'cv' | 'cvTree' | 'placeholder';
 
 interface BaseNodeData {
   entityType: PipelineNodeType;
@@ -23,11 +23,6 @@ export interface RuleNodeData extends BaseNodeData {
   entity: Rule;
 }
 
-export interface FeatureNodeData extends BaseNodeData {
-  entityType: 'feature';
-  entity: Feature;
-}
-
 export interface LFNodeData extends BaseNodeData {
   entityType: 'lf';
   entity: LabelingFunction;
@@ -38,23 +33,34 @@ export interface SnorkelNodeData extends BaseNodeData {
   entity: SnorkelJob;
 }
 
-export interface ClassifierNodeData extends BaseNodeData {
-  entityType: 'classifier';
-  entity: ClassifierJob;
-}
-
 export interface CVNodeData extends BaseNodeData {
   entityType: 'cv';
   entity: ConceptValue;
 }
 
+export interface CVTreeNodeData extends BaseNodeData {
+  entityType: 'cvTree';
+  entity: ConceptValue;
+  hasCompletedSnorkel: boolean;
+  ruleCount: number;
+  lfCount: number;
+  snorkelStatus: 'completed' | 'running' | 'none';
+}
+
+export interface PlaceholderNodeData extends BaseNodeData {
+  entityType: 'placeholder';
+  targetType: PipelineNodeType;
+  hideTopHandle?: boolean;
+  hideBottomHandle?: boolean;
+}
+
 export type PipelineNodeData =
   | IndexNodeData
   | RuleNodeData
-  | FeatureNodeData
   | LFNodeData
   | SnorkelNodeData
-  | ClassifierNodeData
-  | CVNodeData;
+  | CVNodeData
+  | CVTreeNodeData
+  | PlaceholderNodeData;
 
 export type PipelineNode = Node<PipelineNodeData>;

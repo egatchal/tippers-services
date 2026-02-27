@@ -1,10 +1,10 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useForm } from 'react-hook-form';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import { RefreshCw } from 'lucide-react';
-import type { SnorkelJob } from '../../types/entities';
+import { RefreshCw, Check, X as XIcon } from 'lucide-react';
+import type { SnorkelJob, LabelingFunction, Index } from '../../types/entities';
 import { runSnorkel, getSnorkelResults, deleteSnorkelJob, cancelSnorkelJob } from '../../api/snorkel';
 import { useConceptStore } from '../../stores/conceptStore';
 import { usePipelineStore } from '../../stores/pipelineStore';
@@ -17,8 +17,10 @@ export default function SnorkelRunPanel({ entity }: { entity: SnorkelJob }) {
   const cId = useConceptStore((s) => s.activeConcept?.c_id);
   const queryClient = useQueryClient();
   const closePanel = usePipelineStore((s) => s.closePanel);
+  const nodes = usePipelineStore((s) => s.nodes);
   const [showDelete, setShowDelete] = useState(false);
   const [showLFTable, setShowLFTable] = useState(false);
+  const [showCVLFMapping, setShowCVLFMapping] = useState(false);
   const [showRerun, setShowRerun] = useState(false);
   const isCompleted = entity.status === 'COMPLETED';
   const isRunning = entity.status === 'RUNNING' || entity.status === 'PENDING';
@@ -47,6 +49,27 @@ export default function SnorkelRunPanel({ entity }: { entity: SnorkelJob }) {
     },
     onError: () => toast.error('Failed to delete'),
   });
+
+  // Build CV → LF mapping
+  const cvLFMapping = useMemo(() => {
+    if (!results?.cv_id_to_name) return [];
+    const lfEntities = nodes
+      .filter((n) => n.data.entityType === 'lf')
+      .map((n) => n.data.entity as LabelingFunction);
+    const lfNameSet = new Set(results.lf_summary?.map((lf) => String(lf.name)) ?? []);
+
+    return Object.entries(results.cv_id_to_name).map(([cvIdStr, cvName]) => {
+      const cvId = Number(cvIdStr);
+      const matchingLFs = lfEntities
+        .filter((lf) => lf.applicable_cv_ids.includes(cvId))
+        .map((lf) => ({
+          name: lf.name,
+          is_active: lf.is_active,
+          inResults: lfNameSet.has(lf.name),
+        }));
+      return { cvId, cvName: String(cvName), lfs: matchingLFs };
+    });
+  }, [results, nodes]);
 
   // Build chart data
   const classDistData = results
@@ -140,6 +163,46 @@ export default function SnorkelRunPanel({ entity }: { entity: SnorkelJob }) {
             </div>
           )}
 
+          {/* CV → LF Mapping */}
+          {cvLFMapping.length > 0 && (
+            <div>
+              <button
+                onClick={() => setShowCVLFMapping(!showCVLFMapping)}
+                className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 uppercase"
+              >
+                {showCVLFMapping ? 'Hide' : 'Show'} CV → LF Mapping
+              </button>
+              {showCVLFMapping && (
+                <div className="mt-2 space-y-2">
+                  {cvLFMapping.map((group) => (
+                    <div key={group.cvId} className="border border-gray-200 rounded p-2">
+                      <p className="text-xs font-semibold text-gray-700 uppercase">{group.cvName} <span className="text-gray-400 font-normal">(cv_id: {group.cvId})</span></p>
+                      {group.lfs.length === 0 ? (
+                        <p className="text-[10px] text-gray-400 mt-1">No LFs for this label</p>
+                      ) : (
+                        <div className="mt-1 space-y-0.5">
+                          {group.lfs.map((lf) => (
+                            <div key={lf.name} className="flex items-center gap-1.5 text-xs">
+                              {lf.is_active ? (
+                                <Check className="w-3 h-3 text-green-500" />
+                              ) : (
+                                <XIcon className="w-3 h-3 text-gray-400" />
+                              )}
+                              <span className={lf.is_active ? 'text-gray-700' : 'text-gray-400'}>
+                                {lf.name}
+                              </span>
+                              {!lf.is_active && <span className="text-[9px] text-gray-400">(inactive)</span>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* LF Coverage/Conflicts Chart */}
           {lfCoverageData.length > 0 && (
             <div>
@@ -219,67 +282,34 @@ export default function SnorkelRunPanel({ entity }: { entity: SnorkelJob }) {
 }
 
 // New Snorkel Run form (used in CreateEntityModal context)
+// Creates a DRAFT snorkel job — index and LFs are connected via canvas edges later.
 export function NewSnorkelRunForm({ onClose }: { onClose: () => void }) {
   const cId = useConceptStore((s) => s.activeConcept?.c_id);
   const queryClient = useQueryClient();
-  const nodes = usePipelineStore((s) => s.nodes);
-
-  const indexes = nodes.filter((n) => n.data.entityType === 'index' && n.data.status === 'materialized');
-  const lfs = nodes.filter((n) => n.data.entityType === 'lf' && (n.data.entity as { is_active?: boolean }).is_active);
 
   const { register, handleSubmit } = useForm({
-    defaultValues: { epochs: 100, lr: 0.01, output_type: 'softmax' },
+    defaultValues: { epochs: 100, lr: 0.01 },
   });
 
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
-  const [selectedLFs, setSelectedLFs] = useState<number[]>([]);
-
-  const runMutation = useMutation({
-    mutationFn: (values: { epochs: number; lr: number; output_type: string }) =>
+  const createMutation = useMutation({
+    mutationFn: (values: { epochs: number; lr: number }) =>
       runSnorkel(cId!, {
-        selectedIndex: selectedIndex!,
-        selectedLFs,
-        snorkel: { epochs: values.epochs, lr: values.lr, output_type: values.output_type },
+        selectedLFs: [],
+        snorkel: { epochs: values.epochs, lr: values.lr },
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['snorkelJobs', cId] });
-      toast.success('Snorkel run started');
+      toast.success('Snorkel job created — connect LFs via edges on canvas');
       onClose();
     },
-    onError: () => toast.error('Failed to start Snorkel run'),
+    onError: () => toast.error('Failed to create Snorkel job'),
   });
 
   return (
-    <form onSubmit={handleSubmit((v) => runMutation.mutate(v))} className="space-y-4 p-4">
-      <div>
-        <label className="block text-xs font-medium text-gray-700 mb-1">Index</label>
-        <select value={selectedIndex ?? ''} onChange={(e) => setSelectedIndex(Number(e.target.value))} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
-          <option value="">Select materialized index...</option>
-          {indexes.map((n) => (
-            <option key={n.id} value={(n.data.entity as { index_id: number }).index_id}>{n.data.label}</option>
-          ))}
-        </select>
-      </div>
+    <form onSubmit={handleSubmit((v) => createMutation.mutate(v))} className="space-y-4 p-4">
+      <p className="text-xs text-gray-500">Index and LFs are connected via edges on the canvas after creation.</p>
 
-      <div>
-        <label className="block text-xs font-medium text-gray-700 mb-1">Active Labeling Functions</label>
-        <div className="space-y-1 max-h-32 overflow-y-auto border border-gray-200 rounded p-2">
-          {lfs.length === 0 && <p className="text-xs text-gray-400">No active LFs</p>}
-          {lfs.map((n) => {
-            const lfId = (n.data.entity as { lf_id: number }).lf_id;
-            return (
-              <label key={n.id} className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={selectedLFs.includes(lfId)} onChange={(e) => {
-                  setSelectedLFs(e.target.checked ? [...selectedLFs, lfId] : selectedLFs.filter((id) => id !== lfId));
-                }} />
-                {n.data.label}
-              </label>
-            );
-          })}
-        </div>
-      </div>
-
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="block text-xs font-medium text-gray-700 mb-1">Epochs</label>
           <input type="number" {...register('epochs', { valueAsNumber: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
@@ -288,19 +318,12 @@ export function NewSnorkelRunForm({ onClose }: { onClose: () => void }) {
           <label className="block text-xs font-medium text-gray-700 mb-1">Learning Rate</label>
           <input type="number" step="0.001" {...register('lr', { valueAsNumber: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md" />
         </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-700 mb-1">Output</label>
-          <select {...register('output_type')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
-            <option value="softmax">Softmax</option>
-            <option value="hard_labels">Hard Labels</option>
-          </select>
-        </div>
       </div>
 
       <div className="flex justify-end gap-3 pt-2">
         <button type="button" onClick={onClose} className="px-4 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50">Cancel</button>
-        <button type="submit" disabled={!selectedIndex || selectedLFs.length === 0 || runMutation.isPending} className="px-4 py-2 text-sm bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:opacity-50">
-          Run Snorkel
+        <button type="submit" disabled={createMutation.isPending} className="px-4 py-2 text-sm bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:opacity-50">
+          Create
         </button>
       </div>
     </form>

@@ -1,0 +1,66 @@
+                                   Table "public.space"
+     Column      |          Type          | Collation | Nullable |         Default
+-----------------+------------------------+-----------+----------+-------------------------
+ space_id        | integer                |           | not null |
+ space_name      | character varying(200) |           |          | NULL::character varying
+ parent_space_id | integer                |           |          |
+ building_room   | character varying(200) |           |          | NULL::character varying
+Indexes:
+    "space_pkey" PRIMARY KEY, btree (space_id)
+    "idx_building_room" btree (building_room)
+    "idx_parent_space_id" btree (parent_space_id)
+    "idx_space_name" btree (space_name)
+    "space_parent_space_id_idx" btree (parent_space_id)
+
+                              Table "public.space_metadata"
+    Column     |          Type          | Collation | Nullable |         Default
+---------------+------------------------+-----------+----------+-------------------------
+ roomid        | integer                |           | not null |
+ typeid        | integer                |           | not null |
+ type          | character varying(200) |           | not null |
+ building_room | character varying(200) |           |          | NULL::character varying
+Indexes:
+    "space_metadata_pkey" PRIMARY KEY, btree (roomid, typeid, type)
+    "idx_roomid" btree (roomid)
+    "idx_type" btree (type)
+    "idx_typeid" btree (typeid)
+
+                           Table "public.faculty_data"
+ Column |          Type          | Collation | Nullable |         Default
+--------+------------------------+-----------+----------+-------------------------
+ name   | character varying(200) |           | not null |
+ office | character varying(200) |           |          | NULL::character varying
+Indexes:
+    "faculty_data_pkey" PRIMARY KEY, btree (name)
+    "idx_name" btree (name)
+    "idx_office" btree (office)
+
+                         Table "public.region_to_coverage"
+         Column          |          Type          | Collation | Nullable | Default
+-------------------------+------------------------+-----------+----------+---------
+ region_id               | integer                |           | not null |
+ space_name              | character varying(200) |           | not null |
+ wapcov_id               | integer                |           | not null |
+ sensor                  | character varying(200) |           | not null |
+ intersection_percentage | real                   |           | not null |
+Indexes:
+    "region_to_coverage_pkey" PRIMARY KEY, btree (region_id, space_name, wapcov_id, sensor, intersection_percentage)
+    "idx_intersection" btree (intersection_percentage)
+    "idx_region_id" btree (region_id)
+    "idx_sensor" btree (sensor)
+    "idx_space" btree (space_name)
+    "idx_wapcov" btree (wapcov_id)
+
+                      Table "public.space_occupancy"
+  Column   |            Type             | Collation | Nullable | Default
+-----------+-----------------------------+-----------+----------+---------
+ space_id  | integer                     |           | not null |
+ occupancy | integer                     |           | not null |
+ beginning | timestamp without time zone |           | not null |
+ end       | timestamp without time zone |           | not null |
+Indexes:
+    "space_occupancy_pkey" PRIMARY KEY, btree (space_id, occupancy, beginning, "end")
+    "idx_begining" btree (beginning)
+    "idx_end" btree ("end")
+    "idx_number_of_connections" btree (occupancy)
+    "idx_space_id" btree (space_id)

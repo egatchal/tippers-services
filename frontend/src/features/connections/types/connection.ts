@@ -16,7 +16,7 @@ export interface DatabaseConnectionCreate {
   port: number;
   database: string;
   user: string;
-  password: string;
+  password?: string;
 }
 
 export interface DatabaseConnectionUpdate {

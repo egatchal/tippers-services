@@ -2,37 +2,21 @@ import { useState, useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
 import type { ExecutionStep } from '../utils/staleness';
-import type { Index, Rule, Feature, SnorkelJob, ClassifierJob } from '../types/entities';
+import type { Index, Rule, SnorkelJob } from '../types/entities';
 import { materializeIndex } from '../api/indexes';
 import { materializeRule } from '../api/rules';
-import { materializeFeature } from '../api/features';
-import { runSnorkel } from '../api/snorkel';
-import { runClassifier } from '../api/classifiers';
+import { executeSnorkelJob } from '../api/snorkel';
 import { POLL_INTERVAL } from '../../../shared/utils/constants';
 
-export interface SnorkelConfig {
-  selectedIndex: number;
-  selectedLFs: number[];
-  snorkel: { epochs?: number; lr?: number; output_type?: string };
-}
-
-export interface ClassifierConfig {
-  snorkel_job_id: number;
-  feature_ids: number[];
-  config: {
-    threshold_method?: string;
-    threshold_value?: number;
-    test_size?: number;
-    random_state?: number;
-    n_estimators?: number;
-    max_depth?: number | null;
-  };
+export interface SnorkelOverrides {
+  epochs?: number;
+  lr?: number;
 }
 
 export type ExecutionStatus = 'idle' | 'running' | 'completed' | 'failed';
 
 interface CompletionCheck {
-  type: 'index' | 'rule' | 'feature' | 'snorkel' | 'classifier';
+  type: 'index' | 'rule' | 'snorkel';
   entityId: number;
 }
 
@@ -48,9 +32,7 @@ export function usePipelineExecution() {
     await Promise.all([
       queryClient.refetchQueries({ queryKey: ['indexes', cId] }),
       queryClient.refetchQueries({ queryKey: ['rules', cId] }),
-      queryClient.refetchQueries({ queryKey: ['features', cId] }),
       queryClient.refetchQueries({ queryKey: ['snorkelJobs', cId] }),
-      queryClient.refetchQueries({ queryKey: ['classifierJobs', cId] }),
     ]);
   }, [queryClient]);
 
@@ -78,9 +60,7 @@ export function usePipelineExecution() {
       await Promise.all([
         queryClient.refetchQueries({ queryKey: ['indexes', cId] }),
         queryClient.refetchQueries({ queryKey: ['rules', cId] }),
-        queryClient.refetchQueries({ queryKey: ['features', cId] }),
         queryClient.refetchQueries({ queryKey: ['snorkelJobs', cId] }),
-        queryClient.refetchQueries({ queryKey: ['classifierJobs', cId] }),
       ]);
 
       let allDone = true;
@@ -99,12 +79,6 @@ export function usePipelineExecution() {
             if (!entity?.is_materialized) allDone = false;
             break;
           }
-          case 'feature': {
-            const list = queryClient.getQueryData<Feature[]>(['features', cId]);
-            const entity = list?.find((f) => f.feature_id === check.entityId);
-            if (!entity?.is_materialized) allDone = false;
-            break;
-          }
           case 'snorkel': {
             const list = queryClient.getQueryData<SnorkelJob[]>(['snorkelJobs', cId]);
             const job = list?.find((j) => j.job_id === check.entityId);
@@ -112,16 +86,6 @@ export function usePipelineExecution() {
               allDone = false;
             } else if (job.status === 'FAILED') {
               throw new Error(job.error_message || `Snorkel job #${check.entityId} failed`);
-            }
-            break;
-          }
-          case 'classifier': {
-            const list = queryClient.getQueryData<ClassifierJob[]>(['classifierJobs', cId]);
-            const job = list?.find((j) => j.job_id === check.entityId);
-            if (!job || job.status === 'RUNNING' || job.status === 'PENDING') {
-              allDone = false;
-            } else if (job.status === 'FAILED') {
-              throw new Error(job.error_message || `Classifier job #${check.entityId} failed`);
             }
             break;
           }
@@ -137,8 +101,7 @@ export function usePipelineExecution() {
   const execute = useCallback(async (
     cId: number,
     plan: ExecutionStep[],
-    snorkelConfig?: SnorkelConfig,
-    classifierConfig?: ClassifierConfig,
+    snorkelOverrides?: SnorkelOverrides,
   ) => {
     if (plan.length === 0) {
       toast.success('Everything is up to date');
@@ -158,9 +121,6 @@ export function usePipelineExecution() {
       tiers.set(step.tier, group);
     }
     const sortedTierKeys = [...tiers.keys()].sort((a, b) => a - b);
-
-    // Track newly-created job IDs so downstream tiers can reference them
-    let newSnorkelJobId: number | null = null;
 
     try {
       for (const tierKey of sortedTierKeys) {
@@ -185,23 +145,11 @@ export function usePipelineExecution() {
                   await materializeRule(cId, step.entityId);
                   check = { type: 'rule', entityId: step.entityId };
                   break;
-                case 'feature':
-                  await materializeFeature(cId, step.entityId);
-                  check = { type: 'feature', entityId: step.entityId };
-                  break;
               }
             } else if (step.action === 'run') {
-              if (step.entityType === 'snorkel' && snorkelConfig) {
-                const job = await runSnorkel(cId, snorkelConfig);
-                newSnorkelJobId = job.job_id;
-                check = { type: 'snorkel', entityId: job.job_id };
-              } else if (step.entityType === 'classifier' && classifierConfig) {
-                // Substitute the NEW snorkel job ID if one was created earlier
-                const finalConfig = newSnorkelJobId
-                  ? { ...classifierConfig, snorkel_job_id: newSnorkelJobId }
-                  : classifierConfig;
-                const job = await runClassifier(cId, finalConfig);
-                check = { type: 'classifier', entityId: job.job_id };
+              if (step.entityType === 'snorkel') {
+                await executeSnorkelJob(cId, step.entityId, snorkelOverrides);
+                check = { type: 'snorkel', entityId: step.entityId };
               }
             }
 

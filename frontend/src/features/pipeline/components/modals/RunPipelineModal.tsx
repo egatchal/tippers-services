@@ -1,16 +1,16 @@
 import { useMemo } from 'react';
 import { useForm } from 'react-hook-form';
 import { X, Check, Loader2, Minus, AlertTriangle, Play } from 'lucide-react';
-import type { SnorkelJob, ClassifierJob } from '../../types/entities';
+import type { SnorkelJob, ConceptValue } from '../../types/entities';
 import type { ExecutionStep } from '../../utils/staleness';
-import { buildExecutionPlan, computeStaleness } from '../../utils/staleness';
+import { buildExecutionPlan, buildExecutionPlanFromEntities, computeStaleness } from '../../utils/staleness';
 import { usePipelineStore } from '../../stores/pipelineStore';
 import { useConceptStore } from '../../stores/conceptStore';
-import { usePipelineExecution, type SnorkelConfig, type ClassifierConfig } from '../../hooks/usePipelineExecution';
+import { usePipelineExecution } from '../../hooks/usePipelineExecution';
 
 type Target =
   | { type: 'snorkel'; entity: SnorkelJob }
-  | { type: 'classifier'; entity: ClassifierJob }
+  | { type: 'cv'; cv: ConceptValue }
   | { type: 'all' };
 
 interface Props {
@@ -21,9 +21,24 @@ interface Props {
 export default function RunPipelineModal({ target, onClose }: Props) {
   const nodes = usePipelineStore((s) => s.nodes);
   const cId = useConceptStore((s) => s.activeConcept?.c_id);
+  const allEntities = useConceptStore((s) => s.allEntities);
+  const conceptValues = useConceptStore((s) => s.conceptValues);
 
-  const staleness = useMemo(() => computeStaleness(nodes), [nodes]);
-  const plan = useMemo(() => buildExecutionPlan(target, nodes, staleness), [target, nodes, staleness]);
+  const staleness = useMemo(
+    () => computeStaleness(nodes, allEntities?.indexes, allEntities?.snorkelJobs),
+    [nodes, allEntities],
+  );
+
+  const plan = useMemo(() => {
+    // For single-snorkel targets, use the canvas-node-based plan (pipeline view)
+    if (target.type === 'snorkel') {
+      return buildExecutionPlan(target, nodes, staleness);
+    }
+    // For 'all' and 'cv' targets, use entity-based planning (tree view / per-CV)
+    if (!allEntities) return [];
+    const cvFilter = target.type === 'cv' ? target.cv.cv_id : undefined;
+    return buildExecutionPlanFromEntities(allEntities, conceptValues, cvFilter);
+  }, [target, nodes, staleness, allEntities, conceptValues]);
 
   const { execute, status, currentTier, completedSteps, error, cancel, reset } = usePipelineExecution();
   const isRunning = status === 'running';
@@ -40,133 +55,75 @@ export default function RunPipelineModal({ target, onClose }: Props) {
     return map;
   }, [plan]);
 
-  const tierLabels: Record<number, string> = {
-    0: 'Indexes',
-    1: 'Rules & Features',
-    2: 'Snorkel',
-    3: 'Classifier',
-  };
+  const tierLabels = useMemo(() => {
+    const labels: Record<number, string> = {};
+    for (const step of plan) {
+      if (!labels[step.tier]) {
+        const entityTier = step.tier % 3;
+        const entityLabel = ['Indexes', 'Rules', 'Snorkel'][entityTier];
+        labels[step.tier] = step.cvName
+          ? `${step.cvName} — ${entityLabel}`
+          : entityLabel;
+      }
+    }
+    // For snorkel-targeted or empty plans, always include the base 3 tiers
+    if (target.type === 'snorkel' || plan.length === 0) {
+      if (!labels[0]) labels[0] = 'Indexes';
+      if (!labels[1]) labels[1] = 'Rules';
+      if (!labels[2]) labels[2] = 'Snorkel';
+    }
+    return labels;
+  }, [plan, target]);
 
-  // Determine which tiers to show based on target
-  const maxTier = target.type === 'snorkel' ? 2 : target.type === 'classifier' ? 3 : 3;
-  const allTierKeys = Array.from({ length: maxTier + 1 }, (_, i) => i);
+  // Determine which tiers to show
+  const allTierKeys = useMemo(() => {
+    const keys = new Set(plan.map((s) => s.tier));
+    // For snorkel-targeted plans, always show all 3 base tiers
+    if (target.type === 'snorkel') {
+      keys.add(0);
+      keys.add(1);
+      keys.add(2);
+    }
+    return [...keys].sort((a, b) => a - b);
+  }, [plan, target]);
 
   // Snorkel config form
   const snorkelStep = plan.find((s) => s.entityType === 'snorkel');
-  const classifierStep = plan.find((s) => s.entityType === 'classifier');
 
   // Pre-fill from entity if available
   const snorkelDefaults = useMemo(() => {
     if (target.type === 'snorkel') {
       const e = target.entity;
-      return { epochs: e.config.epochs ?? 100, lr: e.config.lr ?? 0.01, output_type: e.output_type || 'softmax' };
+      return { epochs: e.config.epochs ?? 100, lr: e.config.lr ?? 0.01 };
     }
-    // For 'all', find most recent completed snorkel job
-    const snorkelNodes = nodes.filter((n) => n.data.entityType === 'snorkel');
-    const completed = snorkelNodes
-      .map((n) => n.data.entity as SnorkelJob)
+    // For 'all' or 'cv', find most recent completed snorkel job from allEntities or canvas nodes
+    const allJobs = allEntities?.snorkelJobs ?? [];
+    const completed = allJobs
       .filter((j) => j.status === 'COMPLETED')
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     if (completed.length > 0) {
-      return { epochs: completed[0].config.epochs ?? 100, lr: completed[0].config.lr ?? 0.01, output_type: completed[0].output_type || 'softmax' };
+      return { epochs: completed[0].config.epochs ?? 100, lr: completed[0].config.lr ?? 0.01 };
     }
-    return { epochs: 100, lr: 0.01, output_type: 'softmax' };
-  }, [target, nodes]);
-
-  const classifierDefaults = useMemo(() => {
-    const extractConfig = (c: Record<string, unknown>) => ({
-      threshold_method: String(c.threshold_method ?? 'max_confidence'),
-      threshold_value: Number(c.threshold_value ?? 0.7),
-      test_size: Number(c.test_size ?? 0.2),
-      random_state: Number(c.random_state ?? 42),
-      n_estimators: Number(c.n_estimators ?? 100),
-      max_depth: c.max_depth != null ? String(c.max_depth) : '',
-    });
-    if (target.type === 'classifier') {
-      return extractConfig(target.entity.config as Record<string, unknown>);
-    }
-    const classifierNodes = nodes.filter((n) => n.data.entityType === 'classifier');
-    const completed = classifierNodes
-      .map((n) => n.data.entity as ClassifierJob)
-      .filter((j) => j.status === 'COMPLETED')
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    if (completed.length > 0) {
-      return extractConfig(completed[0].config as Record<string, unknown>);
-    }
-    return { threshold_method: 'max_confidence', threshold_value: 0.7, test_size: 0.2, random_state: 42, n_estimators: 100, max_depth: '' };
-  }, [target, nodes]);
+    return { epochs: 100, lr: 0.01 };
+  }, [target, allEntities]);
 
   const snorkelForm = useForm({ defaultValues: snorkelDefaults });
-  const classifierForm = useForm({ defaultValues: classifierDefaults });
-
-  // Resolve the snorkel entity whose config we'll use (index_id, lf_ids, etc.)
-  const snorkelEntity = useMemo((): SnorkelJob | null => {
-    if (target.type === 'snorkel') return target.entity;
-    // For 'classifier' or 'all': look up the entity from the plan step
-    if (snorkelStep) {
-      const n = nodes.find((nd) => nd.data.entityType === 'snorkel' && (nd.data.entity as SnorkelJob).job_id === snorkelStep.entityId);
-      if (n) return n.data.entity as SnorkelJob;
-    }
-    // Fallback for 'classifier' target: the source snorkel job
-    if (target.type === 'classifier') {
-      const srcId = target.entity.snorkel_job_id;
-      const n = nodes.find((nd) => nd.data.entityType === 'snorkel' && (nd.data.entity as SnorkelJob).job_id === srcId);
-      if (n) return n.data.entity as SnorkelJob;
-    }
-    return null;
-  }, [target, snorkelStep, nodes]);
-
-  // Resolve the classifier entity whose config we'll use (feature_ids, etc.)
-  const classifierEntity = useMemo((): ClassifierJob | null => {
-    if (target.type === 'classifier') return target.entity;
-    if (classifierStep) {
-      const n = nodes.find((nd) => nd.data.entityType === 'classifier' && (nd.data.entity as ClassifierJob).job_id === classifierStep.entityId);
-      if (n) return n.data.entity as ClassifierJob;
-    }
-    return null;
-  }, [target, classifierStep, nodes]);
 
   const handleRun = () => {
     if (!cId) return;
-
     const snorkelValues = snorkelForm.getValues();
-    const classifierValues = classifierForm.getValues();
-
-    // Build snorkel config from the resolved entity + form overrides.
-    // The hook creates a NEW snorkel job with these params.
-    const snorkelConfig: SnorkelConfig | undefined = snorkelEntity ? {
-      selectedIndex: snorkelEntity.index_id,
-      selectedLFs: snorkelEntity.lf_ids,
-      snorkel: {
-        epochs: snorkelValues.epochs,
-        lr: snorkelValues.lr,
-        output_type: snorkelValues.output_type,
-      },
-    } : undefined;
-
-    // Build classifier config. snorkel_job_id here is a *fallback*;
-    // the hook will substitute the NEW snorkel job ID if one was created
-    // during this execution.
-    const classifierConfig: ClassifierConfig | undefined = classifierEntity ? {
-      snorkel_job_id: classifierEntity.snorkel_job_id,
-      feature_ids: classifierEntity.feature_ids,
-      config: {
-        threshold_method: classifierValues.threshold_method,
-        threshold_value: classifierValues.threshold_value,
-        test_size: classifierValues.test_size,
-        random_state: classifierValues.random_state,
-        n_estimators: classifierValues.n_estimators,
-        max_depth: classifierValues.max_depth === '' ? null : Number(classifierValues.max_depth),
-      },
-    } : undefined;
-
-    execute(cId, plan, snorkelConfig, classifierConfig);
+    // Pass epoch/lr overrides — the hook calls executeSnorkelJob(job_id) on the existing job
+    execute(cId, plan, snorkelStep ? { epochs: snorkelValues.epochs, lr: snorkelValues.lr } : undefined);
   };
 
+  const selectedCV = useConceptStore((s) => s.selectedCV);
+
   const title = target.type === 'snorkel'
-    ? 'Re-run to Snorkel'
-    : target.type === 'classifier'
-    ? 'Re-run to Classifier'
+    ? `Re-run to Snorkel${selectedCV ? ` (${selectedCV.name})` : ''}`
+    : target.type === 'cv'
+    ? `Re-run Pipeline — ${target.cv.name}`
+    : selectedCV
+    ? `Re-run Pipeline — ${selectedCV.name}`
     : 'Re-run Pipeline';
 
   return (
@@ -223,10 +180,10 @@ export default function RunPipelineModal({ target, onClose }: Props) {
                 )}
 
                 {/* Inline config for snorkel tier */}
-                {tierKey === 2 && snorkelStep && !isRunning && !isDone && (
+                {tierKey % 3 === 2 && snorkelStep && !isRunning && !isDone && (
                   <div className="ml-6 mt-2 p-3 bg-gray-50 rounded border border-gray-200 space-y-2">
                     <p className="text-[10px] font-semibold text-gray-500 uppercase">Snorkel Config</p>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="grid grid-cols-2 gap-2">
                       <div>
                         <label className="block text-[10px] text-gray-500 mb-0.5">Epochs</label>
                         <input type="number" {...snorkelForm.register('epochs', { valueAsNumber: true })} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
@@ -234,49 +191,6 @@ export default function RunPipelineModal({ target, onClose }: Props) {
                       <div>
                         <label className="block text-[10px] text-gray-500 mb-0.5">LR</label>
                         <input type="number" step="0.001" {...snorkelForm.register('lr', { valueAsNumber: true })} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Output</label>
-                        <select {...snorkelForm.register('output_type')} className="w-full px-2 py-1 text-xs border border-gray-300 rounded">
-                          <option value="softmax">Softmax</option>
-                          <option value="hard_labels">Hard Labels</option>
-                        </select>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Inline config for classifier tier */}
-                {tierKey === 3 && classifierStep && !isRunning && !isDone && (
-                  <div className="ml-6 mt-2 p-3 bg-gray-50 rounded border border-gray-200 space-y-2">
-                    <p className="text-[10px] font-semibold text-gray-500 uppercase">Classifier Config</p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Threshold Method</label>
-                        <select {...classifierForm.register('threshold_method')} className="w-full px-2 py-1 text-xs border border-gray-300 rounded">
-                          <option value="max_confidence">Max Confidence</option>
-                          <option value="entropy">Entropy</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Threshold</label>
-                        <input type="number" step="0.05" {...classifierForm.register('threshold_value', { valueAsNumber: true })} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Test Size</label>
-                        <input type="number" step="0.05" {...classifierForm.register('test_size', { valueAsNumber: true })} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Random State</label>
-                        <input type="number" {...classifierForm.register('random_state', { valueAsNumber: true })} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Estimators</label>
-                        <input type="number" {...classifierForm.register('n_estimators', { valueAsNumber: true })} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-gray-500 mb-0.5">Max Depth</label>
-                        <input type="number" placeholder="None" {...classifierForm.register('max_depth')} className="w-full px-2 py-1 text-xs border border-gray-300 rounded" />
                       </div>
                     </div>
                   </div>

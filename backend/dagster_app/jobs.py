@@ -1,7 +1,7 @@
 """Dagster job definitions for weak supervision pipeline."""
 import os
 from dagster import define_asset_job, AssetSelection, multiprocess_executor
-from backend.dagster_app.assets import occupancy_incremental_graph
+from backend.dagster_app.assets import occupancy_incremental_graph, snorkel_pipeline_graph
 from backend.dagster_app.resources import s3_resource
 
 # Job to materialize a single index
@@ -32,6 +32,12 @@ snorkel_training_pipeline = define_asset_job(
 classifier_training_pipeline = define_asset_job(
     name="classifier_training_pipeline",
     selection=AssetSelection.keys("classifier_training")
+)
+
+# Snorkel full pipeline: index → rules (parallel) → Snorkel training
+snorkel_pipeline_job = snorkel_pipeline_graph.to_job(
+    name="snorkel_pipeline_job",
+    resource_defs={"s3_storage": s3_resource},
 )
 
 # Incremental occupancy job — fan-out source chunks in parallel, then aggregate

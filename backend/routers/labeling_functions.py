@@ -90,17 +90,18 @@ async def create_labeling_function(
     - **allowed_imports**: List of allowed import modules
     - **parent_lf_id**: Optional parent LF ID for versioning
     """
-    # Verify rule exists and belongs to concept
-    rule = db.query(ConceptRule).filter(
-        ConceptRule.c_id == c_id,
-        ConceptRule.r_id == request.rule_id
-    ).first()
+    # Verify rule exists and belongs to concept (rule_id is optional — set via canvas edge)
+    if request.rule_id is not None:
+        rule = db.query(ConceptRule).filter(
+            ConceptRule.c_id == c_id,
+            ConceptRule.r_id == request.rule_id
+        ).first()
 
-    if not rule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Rule with ID {request.rule_id} not found for concept {c_id}"
-        )
+        if not rule:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Rule with ID {request.rule_id} not found for concept {c_id}"
+            )
 
     # Validate applicable_cv_ids — batch lookup
     concept_values = db.query(ConceptValue).filter(
@@ -454,6 +455,18 @@ async def update_labeling_function(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Labeling function with name '{update_data['name']}' already exists for concept {c_id}"
+            )
+
+    # Validate rule_id if updating
+    if "rule_id" in update_data:
+        rule = db.query(ConceptRule).filter(
+            ConceptRule.c_id == c_id,
+            ConceptRule.r_id == update_data["rule_id"]
+        ).first()
+        if not rule:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Rule with ID {update_data['rule_id']} not found for concept {c_id}"
             )
 
     # Validate applicable_cv_ids if updating

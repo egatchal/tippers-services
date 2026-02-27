@@ -7,21 +7,21 @@ import { statusBorderClass, type NodeStatus } from '../../../../shared/utils/sta
 const typeColors: Record<PipelineNodeType, string> = {
   index: 'bg-blue-50',
   rule: 'bg-purple-50',
-  feature: 'bg-cyan-50',
   lf: 'bg-amber-50',
   snorkel: 'bg-emerald-50',
-  classifier: 'bg-pink-50',
   cv: 'bg-indigo-50',
+  cvTree: 'bg-indigo-50',
+  placeholder: 'bg-gray-50',
 };
 
 const typeLabels: Record<PipelineNodeType, string> = {
   index: 'Index',
   rule: 'Rule',
-  feature: 'Feature',
   lf: 'Labeling Function',
   snorkel: 'Snorkel Run',
-  classifier: 'Classifier',
   cv: 'Concept Value',
+  cvTree: 'Concept Value',
+  placeholder: 'Placeholder',
 };
 
 const statusIcons: Record<NodeStatus, React.ReactNode> = {
@@ -38,10 +38,27 @@ interface BaseNodeProps {
   icon: React.ReactNode;
 }
 
+const handleStyle = {
+  width: 12,
+  height: 12,
+  border: '2px solid white',
+  borderRadius: '50%',
+};
+
+// Entity types that should hide specific handles
+const hideTargetHandle = new Set<PipelineNodeType>(['index']);
+const hideSourceHandle = new Set<PipelineNodeType>([]);
+
 function BaseNode({ data, icon }: BaseNodeProps) {
   return (
     <div className={`relative w-[280px] rounded-lg border-2 shadow-sm ${statusBorderClass[data.status]} ${typeColors[data.entityType]} px-3 py-2`}>
-      <Handle type="target" position={Position.Top} className="!bg-gray-400 !w-2 !h-2" />
+      {!hideTargetHandle.has(data.entityType) && (
+        <Handle
+          type="target"
+          position={Position.Top}
+          style={{ ...handleStyle, background: '#9ca3af', top: -6 }}
+        />
+      )}
 
       <div className="flex items-center gap-2">
         <div className="shrink-0">{icon}</div>
@@ -71,7 +88,13 @@ function BaseNode({ data, icon }: BaseNodeProps) {
         </div>
       </div>
 
-      <Handle type="source" position={Position.Bottom} className="!bg-gray-400 !w-2 !h-2" />
+      {!hideSourceHandle.has(data.entityType) && (
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          style={{ ...handleStyle, background: '#9ca3af', bottom: -6 }}
+        />
+      )}
     </div>
   );
 }

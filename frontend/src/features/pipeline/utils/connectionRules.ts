@@ -2,12 +2,12 @@ import type { PipelineNodeType } from '../types/nodes';
 
 // Valid source → target pairs for edge drawing
 const validConnections: Record<string, PipelineNodeType[]> = {
-  index: ['rule', 'feature'],
+  index: ['rule', 'index', 'cvTree'],
   rule: ['lf'],
-  cv: ['lf'],
+  cv: ['lf', 'cv'],
+  cvTree: ['cvTree'],
   lf: ['snorkel'],
-  feature: ['classifier'],
-  snorkel: ['classifier'],
+  snorkel: ['index'],
 };
 
 export function isValidConnection(sourceType: PipelineNodeType, targetType: PipelineNodeType): boolean {

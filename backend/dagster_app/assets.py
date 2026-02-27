@@ -12,11 +12,12 @@ import pandas as pd
 import numpy as np
 import os
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 import json
 from cryptography.fernet import Fernet
 from jinja2 import Template
 from backend.utils.dataset_registry import register_dataset
+from backend.utils.resolve_entities import resolve_entity_ids
 
 
 def _update_unified_job(session, dagster_run_id: str, status: str, error_message: str = None):
@@ -87,13 +88,22 @@ def get_storage_path(asset_type: str, asset_id: int) -> str:
     return f"{base_path}/{asset_type}_{asset_id}.parquet"
 
 
-def decrypt_password(encrypted_password: str) -> str:
+def decrypt_password(encrypted_password: str | None) -> str:
     """Decrypt password using encryption key from environment."""
+    if not encrypted_password:
+        return ""
     encryption_key = os.getenv("ENCRYPTION_KEY")
     if not encryption_key:
         raise ValueError("ENCRYPTION_KEY environment variable not set")
     cipher_suite = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
     return cipher_suite.decrypt(encrypted_password.encode()).decode()
+
+
+def build_conn_string(conn_type: str, user: str, password: str, host: str, port: int, database: str) -> str:
+    """Build a SQLAlchemy connection string, omitting password if empty."""
+    if password:
+        return f"{conn_type}://{user}:{password}@{host}:{port}/{database}"
+    return f"{conn_type}://{user}@{host}:{port}/{database}"
 
 
 @asset(
@@ -141,16 +151,13 @@ def materialized_index(context: AssetExecutionContext) -> Output[Dict[str, Any]]
             raise ValueError(f"Index with ID {index_id} not found")
 
         # Build connection string to external database
-        conn_type = index_row.connection_type
-        user = index_row.user
         password = decrypt_password(index_row.encrypted_password)
-        host = index_row.host
-        port = index_row.port
-        database = index_row.database
+        external_conn_str = build_conn_string(
+            index_row.connection_type, index_row.user, password,
+            index_row.host, index_row.port, index_row.database,
+        )
 
-        external_conn_str = f"{conn_type}://{user}:{password}@{host}:{port}/{database}"
-
-        context.log.info(f"Connecting to external database: {host}:{port}/{database}")
+        context.log.info(f"Connecting to external database: {index_row.host}:{index_row.port}/{index_row.database}")
 
         # Execute query on external database
         external_engine = create_engine(external_conn_str)
@@ -161,6 +168,14 @@ def materialized_index(context: AssetExecutionContext) -> Output[Dict[str, Any]]
         df = pd.read_sql(sql_query, external_engine)
 
         context.log.info(f"Query returned {len(df)} rows")
+
+        # Extract unique key values if key_column is set (index = key set)
+        key_column = index_row.key_column
+        if key_column:
+            if key_column not in df.columns:
+                raise ValueError(f"key_column '{key_column}' not found. Available: {list(df.columns)}")
+            df = df[[key_column]].drop_duplicates().reset_index(drop=True)
+            context.log.info(f"Extracted {len(df)} unique keys from column '{key_column}'")
 
         # Compute column stats
         column_stats = compute_column_stats(df)
@@ -207,6 +222,49 @@ def materialized_index(context: AssetExecutionContext) -> Output[Dict[str, Any]]
         )
 
         session.commit()
+
+        # Cascade: update derived indexes that depend on this SQL index
+        try:
+            derived_rows = session.execute(
+                text("""
+                SELECT index_id FROM concept_indexes
+                WHERE parent_index_id = :index_id AND source_type = 'derived'
+                """),
+                {"index_id": index_id},
+            ).fetchall()
+
+            if derived_rows:
+                from backend.utils.resolve_entities import resolve_entity_ids as _resolve_ids
+                for d_row in derived_rows:
+                    try:
+                        df_derived = _resolve_ids(d_row.index_id, session)
+                        derived_stats = compute_column_stats(df_derived)
+                        session.execute(
+                            text("""
+                            UPDATE concept_indexes
+                            SET row_count = :row_count,
+                                filtered_count = :filtered_count,
+                                column_stats = :column_stats,
+                                materialized_at = :now,
+                                updated_at = :now
+                            WHERE index_id = :did
+                            """),
+                            {
+                                "did": d_row.index_id,
+                                "row_count": len(df_derived),
+                                "filtered_count": len(df_derived),
+                                "column_stats": json.dumps(derived_stats),
+                                "now": datetime.utcnow(),
+                            },
+                        )
+                        context.log.info(
+                            f"Cascade-updated derived index {d_row.index_id}: {len(df_derived)} rows"
+                        )
+                    except Exception as de:
+                        context.log.warning(f"Failed to cascade-update derived index {d_row.index_id}: {de}")
+                session.commit()
+        except Exception as cascade_err:
+            context.log.warning(f"Failed to cascade-update derived indexes: {cascade_err}")
 
         _update_unified_job(session, context.run_id, "COMPLETED")
 
@@ -283,6 +341,7 @@ def materialized_rule(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
         result = session.execute(
             text("""
             SELECT cr.*, ci.conn_id, ci.storage_path as index_storage_path,
+                   ci.source_type as index_source_type, ci.key_column as index_key_column,
                    dc.host, dc.port, dc.database, dc.user, dc.encrypted_password, dc.connection_type
             FROM concept_rules cr
             JOIN concept_indexes ci ON cr.index_id = ci.index_id
@@ -297,29 +356,15 @@ def materialized_rule(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
         if not rule_row:
             raise ValueError(f"Rule with ID {rule_id} not found")
 
-        # Load index data from S3 or local path
-        index_storage_path = rule_row.index_storage_path
-        context.log.info(f"Loading index data from {index_storage_path}")
+        # Resolve entity IDs — works for both SQL and derived indexes
+        from backend.utils.resolve_entities import resolve_entity_ids
+        df_index = resolve_entity_ids(rule_row.index_id, session)
 
-        # Download from S3 if needed
-        if index_storage_path.startswith("s3://"):
-            # Parse S3 path
-            s3_path_parts = index_storage_path.replace("s3://", "").split("/", 1)
-            s3_bucket = s3_path_parts[0]
-            s3_key = s3_path_parts[1]
-
-            # Download to temp file
-            local_index_path = f"/tmp/index_{rule_row.index_id}.parquet"
-            s3_client = context.resources.s3_storage.get_client()
-            s3_client.download_file(s3_bucket, s3_key, local_index_path)
-            df_index = pd.read_parquet(local_index_path)
-        else:
-            df_index = pd.read_parquet(index_storage_path)
-
-        context.log.info(f"Loaded {len(df_index)} rows from index")
+        context.log.info(f"Resolved {len(df_index)} entity rows from index {rule_row.index_id}")
 
         # Extract values from index_column for filtering
-        index_column = rule_row.index_column or df_index.columns[0]  # Default to first column
+        # Fallback: rule.index_column → parent index.key_column → first column
+        index_column = rule_row.index_column or rule_row.index_key_column or df_index.columns[0]
         context.log.info(f"Extracting values from column: {index_column}")
 
         if index_column not in df_index.columns:
@@ -328,37 +373,48 @@ def materialized_rule(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
         index_values = df_index[index_column].unique().tolist()
         context.log.info(f"Extracted {len(index_values)} unique values from {index_column}")
 
-        # Format values for SQL IN clause
-        # Handle both string and numeric values
-        def format_sql_value(val):
-            if isinstance(val, str):
-                # Escape single quotes in strings
-                escaped = val.replace("'", "''")
-                return f"'{escaped}'"
-            else:
-                return str(val)
-
-        formatted_values = ", ".join([format_sql_value(v) for v in index_values])
-
-        # Replace :index_values placeholder with formatted values
-        rendered_sql = rule_row.sql_query.replace(":index_values", formatted_values)
-
-        # Also support additional template parameters if needed (backward compatibility)
-        if rule_row.query_template_params:
-            sql_template = Template(rendered_sql)
-            rendered_sql = sql_template.render(**rule_row.query_template_params)
-
-        context.log.info(f"Rendered SQL query (first 200 chars): {rendered_sql[:200]}...")
-        context.log.info(f"Total query length: {len(rendered_sql)} characters")
-
-        # Connect to external database and execute query
+        # Connect to external database
         password = decrypt_password(rule_row.encrypted_password)
-        external_conn_str = f"{rule_row.connection_type}://{rule_row.user}:{password}@{rule_row.host}:{rule_row.port}/{rule_row.database}"
-
+        external_conn_str = build_conn_string(
+            rule_row.connection_type, rule_row.user, password,
+            rule_row.host, rule_row.port, rule_row.database,
+        )
         context.log.info(f"Connecting to external database: {rule_row.host}:{rule_row.port}/{rule_row.database}")
-
         external_engine = create_engine(external_conn_str)
-        df_features = pd.read_sql(rendered_sql, external_engine)
+
+        # Use temp table approach for entity IDs — avoids SQL string length issues
+        # and SQL injection; works for any entity count
+        with external_engine.connect() as ext_conn:
+            # Determine PG type from first value
+            sample_val = index_values[0] if index_values else ""
+            pg_type = "TEXT" if isinstance(sample_val, str) else "BIGINT"
+
+            ext_conn.execute(text(f"CREATE TEMP TABLE _tippers_entity_ids (entity_id {pg_type}) ON COMMIT DROP"))
+
+            # Batch insert entity IDs in chunks of 1000
+            BATCH_SIZE = 1000
+            for i in range(0, len(index_values), BATCH_SIZE):
+                batch = index_values[i:i + BATCH_SIZE]
+                values_clause = ", ".join([f"(:v{j})" for j in range(len(batch))])
+                params = {f"v{j}": v for j, v in enumerate(batch)}
+                ext_conn.execute(text(f"INSERT INTO _tippers_entity_ids (entity_id) VALUES {values_clause}"), params)
+
+            context.log.info(f"Inserted {len(index_values)} entity IDs into temp table")
+
+            # Replace :index_values placeholder with temp table subquery
+            rendered_sql = rule_row.sql_query.replace(
+                ":index_values",
+                "(SELECT entity_id FROM _tippers_entity_ids)"
+            )
+
+            # Support Jinja2 template params
+            if rule_row.query_template_params:
+                sql_template = Template(rendered_sql)
+                rendered_sql = sql_template.render(**rule_row.query_template_params)
+
+            context.log.info(f"Rendered SQL query (first 200 chars): {rendered_sql[:200]}...")
+
+            df_features = pd.read_sql(text(rendered_sql), ext_conn)
 
         context.log.info(f"Computed features: {len(df_features)} rows, {len(df_features.columns)} columns")
 
@@ -479,6 +535,7 @@ def materialized_feature(context: AssetExecutionContext) -> Output[Dict[str, Any
         result = session.execute(
             text("""
             SELECT cf.*, ci.conn_id, ci.storage_path as index_storage_path,
+                   ci.key_column as index_key_column,
                    dc.host, dc.port, dc.database, dc.user, dc.encrypted_password, dc.connection_type
             FROM concept_features cf
             JOIN concept_indexes ci ON cf.index_id = ci.index_id
@@ -511,7 +568,8 @@ def materialized_feature(context: AssetExecutionContext) -> Output[Dict[str, Any
         context.log.info(f"Loaded {len(df_index)} rows from index")
 
         # Extract values from index_column for filtering
-        index_column = feature_row.index_column or df_index.columns[0]
+        # Fallback: feature.index_column → parent index.key_column → first column
+        index_column = feature_row.index_column or feature_row.index_key_column or df_index.columns[0]
         context.log.info(f"Extracting values from column: {index_column}")
 
         if index_column not in df_index.columns:
@@ -542,7 +600,10 @@ def materialized_feature(context: AssetExecutionContext) -> Output[Dict[str, Any
 
         # Connect to external database and execute query
         password = decrypt_password(feature_row.encrypted_password)
-        external_conn_str = f"{feature_row.connection_type}://{feature_row.user}:{password}@{feature_row.host}:{feature_row.port}/{feature_row.database}"
+        external_conn_str = build_conn_string(
+            feature_row.connection_type, feature_row.user, password,
+            feature_row.host, feature_row.port, feature_row.database,
+        )
 
         context.log.info(f"Connecting to external database: {feature_row.host}:{feature_row.port}/{feature_row.database}")
 
@@ -1323,9 +1384,9 @@ def snorkel_training(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
     """
     Train Snorkel label model and generate probabilistic labels.
 
-    For each selected LF, loads the associated rule's materialized parquet,
-    joins all rule feature DataFrames, applies labeling functions with
-    cv_id-to-index remapping, and trains Snorkel's LabelModel.
+    Each LF runs on its own rule's feature DataFrame (no cross-rule join).
+    The label matrix is anchored to the full index entity set so that
+    entities not covered by a rule receive ABSTAIN (-1) in that LF's column.
 
     Returns metadata about the labeled dataset.
     """
@@ -1399,56 +1460,73 @@ def snorkel_training(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
 
         context.log.info(f"Concept value constants: {cv_name_to_id}")
 
-        # Load rule feature DataFrames and look up index columns
+        # ── Load the full index entity set as the anchor ──
+        df_index = resolve_entity_ids(job_row.index_id, session)
+
+        # Determine the key column from the index
+        index_meta = session.execute(
+            text("SELECT key_column FROM concept_indexes WHERE index_id = :idx"),
+            {"idx": job_row.index_id}
+        ).fetchone()
+        anchor_col = (index_meta.key_column if index_meta and index_meta.key_column
+                      else df_index.columns[0])
+
+        # The anchor: ordered list of all entity IDs in the index
+        anchor_ids = df_index[anchor_col].drop_duplicates().reset_index(drop=True)
+        n_samples = len(anchor_ids)
+        anchor_id_to_pos = {eid: pos for pos, eid in enumerate(anchor_ids)}
+
+        context.log.info(f"Index anchor: {n_samples} entities, key_column='{anchor_col}'")
+
+        # ── Load rule feature DataFrames (deduplicated by rule_id) ──
         s3_resource = context.resources.s3_storage
-        rule_dfs = {}
-        rule_index_cols = {}
+        rule_dfs = {}        # rule_id → DataFrame
+        rule_key_cols = {}   # rule_id → key column name
         for lf in lfs:
             if lf.rule_id not in rule_dfs:
                 context.log.info(f"Loading features for rule_id={lf.rule_id}")
-                rule_dfs[lf.rule_id] = load_rule_features(lf.rule_id, session, s3_resource, context)
+                df_rule = load_rule_features(lf.rule_id, session, s3_resource, context)
+                rule_dfs[lf.rule_id] = df_rule
 
-                # Look up the index_column for this rule
+                # Look up the rule's key column
                 rule_meta = session.execute(
                     text("SELECT index_column FROM concept_rules WHERE r_id = :rule_id"),
                     {"rule_id": lf.rule_id}
                 ).fetchone()
-                idx_col = rule_meta.index_column if rule_meta and rule_meta.index_column else rule_dfs[lf.rule_id].columns[0]
-                rule_index_cols[lf.rule_id] = idx_col
+                key_col = (rule_meta.index_column if rule_meta and rule_meta.index_column
+                           else df_rule.columns[0])
+                rule_key_cols[lf.rule_id] = key_col
 
-        # Join all rule feature DataFrames on the index column (outer join)
-        rule_ids = list(rule_dfs.keys())
-        first_rid = rule_ids[0]
-        idx_col = rule_index_cols[first_rid]
-        df_features = rule_dfs[first_rid].set_index(idx_col)
-
-        for rid in rule_ids[1:]:
-            idx_col = rule_index_cols[rid]
-            other_df = rule_dfs[rid].set_index(idx_col)
-            df_features = df_features.join(other_df, how="outer", rsuffix=f"_rule{rid}")
-
-        df_features = df_features.reset_index()
-
-        context.log.info(f"Combined feature DataFrame: {len(df_features)} rows, {len(df_features.columns)} columns")
-
-        # Apply labeling functions to create label matrix
-        n_samples = len(df_features)
+        # ── Apply each LF on its own rule's DataFrame, then align to anchor ──
         n_lfs = len(lfs)
-        L = np.full((n_samples, n_lfs), -1, dtype=int)  # Label matrix, default abstain
+        L = np.full((n_samples, n_lfs), -1, dtype=int)  # default ABSTAIN
 
         for i, lf in enumerate(lfs):
-            context.log.info(f"Applying LF {i+1}/{n_lfs}: {lf.name}")
+            context.log.info(f"Applying LF {i+1}/{n_lfs}: {lf.name} (rule_id={lf.rule_id})")
             valid_cv_ids = set(int(cv) for cv in lf.applicable_cv_ids)
 
+            df_rule = rule_dfs[lf.rule_id]
+            key_col = rule_key_cols[lf.rule_id]
+
             try:
-                # Apply LF on the combined DataFrame (columns from all rules are present)
-                L[:, i] = apply_custom_lf(df_features, lf.lf_config, valid_cv_ids, cv_id_to_index,
-                                          cv_name_to_id, context)
+                # Run LF on the rule's own feature DataFrame (complete data, no NaN)
+                lf_labels = apply_custom_lf(
+                    df_rule, lf.lf_config, valid_cv_ids,
+                    cv_id_to_index, cv_name_to_id, context
+                )
+
+                # Map labels back to the anchor positions
+                rule_entity_ids = df_rule[key_col].values
+                for j, eid in enumerate(rule_entity_ids):
+                    pos = anchor_id_to_pos.get(eid)
+                    if pos is not None:
+                        L[pos, i] = lf_labels[j]
+
             except Exception as e:
                 context.log.error(f"Error applying LF {lf.name}: {str(e)}")
-                L[:, i] = -1
+                # Column stays all -1 (ABSTAIN)
 
-        context.log.info("Label matrix created")
+        context.log.info(f"Label matrix created: {n_samples} samples x {n_lfs} LFs")
 
         # ---- Compute LF summary stats from label matrix ----
         lf_summary = []
@@ -1642,42 +1720,69 @@ def snorkel_training(context: AssetExecutionContext) -> Output[Dict[str, Any]]:
                 },
             }
 
-        # Store results locally
+        # Build predictions DataFrame (parquet): sample_id + probs array
+        sample_ids = result_data.get("sample_ids", list(range(n_samples)))
+        if "probabilities" in result_data:
+            probs_list = result_data["probabilities"]
+        else:
+            # Hard labels → one-hot encoding
+            labels = result_data.get("labels", [])
+            probs_list = []
+            for lbl in labels:
+                one_hot = [0.0] * cardinality
+                if 0 <= lbl < cardinality:
+                    one_hot[lbl] = 1.0
+                probs_list.append(one_hot)
+
+        df_predictions = pd.DataFrame({
+            "sample_id": sample_ids,
+            "probs": probs_list,
+        })
+
+        # Store predictions parquet locally then upload to S3
         local_storage_path = get_storage_path("snorkel_job", job_id)
-        local_storage_path = local_storage_path.replace('.parquet', '.json')
+        df_predictions.to_parquet(local_storage_path, index=False)
+        context.log.info(f"Predictions parquet saved locally to {local_storage_path}")
 
-        with open(local_storage_path, 'w') as f:
-            json.dump(result_data, f)
-
-        context.log.info(f"Results saved locally to {local_storage_path}")
-
-        # Upload to S3
         s3_client = context.resources.s3_storage.get_client()
         s3_bucket = context.resources.s3_storage.bucket_name
-        s3_key = f"snorkel_jobs/job_{job_id}.json"
+        s3_key = f"snorkel_jobs/job_{job_id}.parquet"
 
         try:
             s3_client.upload_file(local_storage_path, s3_bucket, s3_key)
             s3_path = f"s3://{s3_bucket}/{s3_key}"
-            context.log.info(f"Results uploaded to S3: {s3_path}")
+            context.log.info(f"Predictions uploaded to S3: {s3_path}")
             storage_path = s3_path
         except Exception as s3_error:
             context.log.warning(f"Failed to upload to S3: {s3_error}. Using local path.")
             storage_path = local_storage_path
 
-        # Update job status
+        # Write metadata to JSONB columns on snorkel_jobs row + update status
         session.execute(
             text("""
             UPDATE snorkel_jobs
             SET status = 'COMPLETED',
                 result_path = :storage_path,
-                completed_at = :now
+                completed_at = :now,
+                lf_summary = :lf_summary,
+                class_distribution = :class_distribution,
+                overall_stats = :overall_stats,
+                cv_id_to_index = :cv_id_to_index,
+                cv_id_to_name = :cv_id_to_name
             WHERE job_id = :job_id
             """),
             {
                 "job_id": job_id,
                 "storage_path": storage_path,
-                "now": datetime.utcnow()
+                "now": datetime.utcnow(),
+                "lf_summary": json.dumps(result_data.get("lf_summary", [])),
+                "class_distribution": json.dumps({
+                    "label_matrix": result_data.get("label_matrix_class_distribution", {}),
+                    "model": result_data.get("model_class_distribution", {}),
+                }),
+                "overall_stats": json.dumps(result_data.get("overall_stats", {})),
+                "cv_id_to_index": json.dumps(result_data.get("cv_id_to_index", {})),
+                "cv_id_to_name": json.dumps(result_data.get("cv_id_to_name", {})),
             }
         )
 
@@ -2205,3 +2310,210 @@ def workflow_advance_sensor(context: SensorEvaluationContext):
         context.log.error(f"workflow_advance_sensor error: {e}")
     finally:
         session.close()
+
+
+# ============================================================================
+# Pipeline Graph — Index → Rules (parallel) → Snorkel Training
+# ============================================================================
+
+@op(
+    config_schema={"index_id": int},
+    required_resource_keys={"s3_storage"},
+    out=Out(int),
+)
+def materialize_index_op(context: OpExecutionContext) -> int:
+    """Op wrapper: materialize a SQL index and return its index_id."""
+    index_id = context.op_config["index_id"]
+
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        result = session.execute(
+            text("""
+            SELECT ci.*, dc.host, dc.port, dc.database, dc.user, dc.encrypted_password, dc.connection_type
+            FROM concept_indexes ci
+            JOIN database_connections dc ON ci.conn_id = dc.conn_id
+            WHERE ci.index_id = :index_id
+            """),
+            {"index_id": index_id}
+        )
+        index_row = result.fetchone()
+        if not index_row:
+            raise ValueError(f"Index with ID {index_id} not found")
+
+        # Execute query on external database
+        password = decrypt_password(index_row.encrypted_password)
+        external_conn_str = build_conn_string(
+            index_row.connection_type, index_row.user, password,
+            index_row.host, index_row.port, index_row.database,
+        )
+        external_engine = create_engine(external_conn_str)
+        df = pd.read_sql(index_row.sql_query, external_engine)
+
+        context.log.info(f"Index {index_id}: {len(df)} rows")
+
+        column_stats = compute_column_stats(df)
+        local_path = get_storage_path("index", index_id)
+        df.to_parquet(local_path, index=False)
+
+        s3_client = context.resources.s3_storage.get_client()
+        s3_bucket = context.resources.s3_storage.bucket_name
+        s3_key = f"indexes/index_{index_id}.parquet"
+
+        try:
+            s3_client.upload_file(local_path, s3_bucket, s3_key)
+            storage_path = f"s3://{s3_bucket}/{s3_key}"
+        except Exception:
+            storage_path = local_path
+
+        session.execute(
+            text("""
+            UPDATE concept_indexes
+            SET is_materialized = true, materialized_at = :now, row_count = :cnt,
+                column_stats = :stats, storage_path = :path, updated_at = :now
+            WHERE index_id = :index_id
+            """),
+            {"index_id": index_id, "now": datetime.utcnow(), "cnt": len(df),
+             "stats": json.dumps(column_stats), "path": storage_path}
+        )
+        session.commit()
+        return index_id
+
+    finally:
+        session.close()
+
+
+@op(
+    config_schema={"rule_ids": list},
+    out=DynamicOut(int),
+)
+def fan_out_rules(context: OpExecutionContext, index_done: int):
+    """Emit each rule_id as a DynamicOutput after the index is materialized."""
+    rule_ids = context.op_config["rule_ids"]
+    context.log.info(f"Fanning out {len(rule_ids)} rules (index {index_done} done)")
+    for rid in rule_ids:
+        yield DynamicOutput(rid, mapping_key=f"rule_{rid}")
+
+
+@op(
+    required_resource_keys={"s3_storage"},
+    out=Out(int),
+)
+def materialize_rule_op(context: OpExecutionContext, rule_id: int) -> int:
+    """Op wrapper: materialize a single rule and return its rule_id."""
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        result = session.execute(
+            text("""
+            SELECT cr.*, ci.conn_id, ci.storage_path as index_storage_path,
+                   dc.host, dc.port, dc.database, dc.user, dc.encrypted_password, dc.connection_type
+            FROM concept_rules cr
+            JOIN concept_indexes ci ON cr.index_id = ci.index_id
+            JOIN database_connections dc ON ci.conn_id = dc.conn_id
+            WHERE cr.r_id = :rule_id
+            """),
+            {"rule_id": rule_id}
+        )
+        rule_row = result.fetchone()
+        if not rule_row:
+            raise ValueError(f"Rule {rule_id} not found")
+
+        from backend.utils.resolve_entities import resolve_entity_ids
+        df_index = resolve_entity_ids(rule_row.index_id, session)
+
+        index_column = rule_row.index_column or df_index.columns[0]
+        index_values = df_index[index_column].unique().tolist()
+
+        password = decrypt_password(rule_row.encrypted_password)
+        external_conn_str = build_conn_string(
+            rule_row.connection_type, rule_row.user, password,
+            rule_row.host, rule_row.port, rule_row.database,
+        )
+        external_engine = create_engine(external_conn_str)
+
+        with external_engine.connect() as ext_conn:
+            sample_val = index_values[0] if index_values else ""
+            pg_type = "TEXT" if isinstance(sample_val, str) else "BIGINT"
+            ext_conn.execute(text(f"CREATE TEMP TABLE _tippers_entity_ids (entity_id {pg_type}) ON COMMIT DROP"))
+
+            BATCH_SIZE = 1000
+            for i in range(0, len(index_values), BATCH_SIZE):
+                batch = index_values[i:i + BATCH_SIZE]
+                values_clause = ", ".join([f"(:v{j})" for j in range(len(batch))])
+                params = {f"v{j}": v for j, v in enumerate(batch)}
+                ext_conn.execute(text(f"INSERT INTO _tippers_entity_ids (entity_id) VALUES {values_clause}"), params)
+
+            rendered_sql = rule_row.sql_query.replace(":index_values", "(SELECT entity_id FROM _tippers_entity_ids)")
+            if rule_row.query_template_params:
+                rendered_sql = Template(rendered_sql).render(**rule_row.query_template_params)
+
+            df_features = pd.read_sql(text(rendered_sql), ext_conn)
+
+        column_stats = compute_column_stats(df_features)
+        local_path = get_storage_path("rule", rule_id)
+        df_features.to_parquet(local_path, index=False)
+
+        s3_client = context.resources.s3_storage.get_client()
+        s3_bucket = context.resources.s3_storage.bucket_name
+        s3_key = f"rules/rule_{rule_id}.parquet"
+
+        try:
+            s3_client.upload_file(local_path, s3_bucket, s3_key)
+            storage_path = f"s3://{s3_bucket}/{s3_key}"
+        except Exception:
+            storage_path = local_path
+
+        session.execute(
+            text("""
+            UPDATE concept_rules
+            SET is_materialized = true, materialized_at = :now, row_count = :cnt,
+                column_stats = :stats, storage_path = :path, updated_at = :now
+            WHERE r_id = :rule_id
+            """),
+            {"rule_id": rule_id, "now": datetime.utcnow(), "cnt": len(df_features),
+             "stats": json.dumps(column_stats), "path": storage_path}
+        )
+        session.commit()
+        context.log.info(f"Rule {rule_id}: {len(df_features)} rows")
+        return rule_id
+
+    finally:
+        session.close()
+
+
+@op(
+    config_schema={"job_id": int},
+    required_resource_keys={"s3_storage"},
+    out=Out(dict),
+)
+def run_snorkel_op(context: OpExecutionContext, rule_results: List[int]) -> dict:
+    """Op wrapper: run Snorkel training after all rules are materialized.
+
+    Delegates to the existing snorkel_training asset logic by triggering it
+    via the Dagster client (keeps logic DRY).
+    """
+    job_id = context.op_config["job_id"]
+    context.log.info(f"All {len(rule_results)} rules done. Running Snorkel job {job_id}")
+
+    from backend.utils.dagster_client import get_dagster_client
+
+    dagster_client = get_dagster_client()
+    result = dagster_client.submit_job_execution(
+        job_name="snorkel_training_pipeline",
+        run_config={"ops": {"snorkel_training": {"config": {"job_id": job_id}}}}
+    )
+
+    return {"job_id": job_id, "dagster_run_id": result["run_id"]}
+
+
+@graph
+def snorkel_pipeline_graph():
+    """Graph: materialize index → fan out rules (parallel) → run Snorkel."""
+    idx = materialize_index_op()
+    rules = fan_out_rules(idx).map(materialize_rule_op).collect()
+    return run_snorkel_op(rules)

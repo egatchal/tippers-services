@@ -1,0 +1,207 @@
+# -- The device connects to fewer than 5 unique rooms, and ≥ 80% of total connection time is spent in rooms affiliated with a single group (each room connected ≥ 10 minutes total).
+group_unique_room_single_room_query:
+  label: NULL
+  query: |
+    WITH user_room_sessions AS (
+    SELECT
+        u.user,
+        r.space_name,
+        TIMESTAMPDIFF(MINUTE, u.beginning, u.end) AS session_minutes
+    FROM
+        user_ap_trajectory u
+    JOIN
+        region_to_coverage r ON u.access_point = r.sensor
+    WHERE user IN ({users_str}) AND r.space_name NOT IN ('NorthClassroom', 'SouthClassroom', 'InnerClassroom')
+    ),
+    user_room_total_minutes AS (
+        SELECT
+            user,
+            space_name,
+            SUM(session_minutes) AS total_minutes_in_room
+        FROM
+            user_room_sessions
+        GROUP BY
+            user,
+            space_name
+        HAVING
+            total_minutes_in_room >= 10 -- Only consider rooms where user spent at least 10 minutes
+    ),
+    user_total_time AS (
+        SELECT
+            user,
+            SUM(total_minutes_in_room) AS total_qualified_minutes
+        FROM
+            user_room_total_minutes
+        GROUP BY
+            user
+    ),
+    user_top_room AS (
+        SELECT
+            user,
+            space_name AS top_space_name,
+            total_minutes_in_room AS top_room_minutes,
+            ROW_NUMBER() OVER (PARTITION BY user ORDER BY total_minutes_in_room DESC) AS rn
+        FROM
+            user_room_total_minutes
+    ),
+    user_top_room_filtered AS (
+        SELECT
+            user,
+            top_space_name,
+            top_room_minutes
+        FROM
+            user_top_room
+        WHERE
+            rn = 1
+    ),
+    user_unique_room_count AS (
+        SELECT
+            user,
+            COUNT(DISTINCT space_name) AS unique_room_count_total
+        FROM
+            user_room_sessions
+        GROUP BY
+            user
+    )
+    SELECT
+        utr.user, utr.top_space_name
+    FROM
+        user_top_room_filtered utr
+    JOIN
+        user_total_time utt ON utr.user = utt.user
+    JOIN
+        user_unique_room_count uurc ON utr.user = uurc.user
+    WHERE
+        (utr.top_room_minutes * 1.0 / utt.total_qualified_minutes) >= 0.8
+        AND uurc.unique_room_count_total <= 5 limit 10; 
+  index: user
+  columns: ["top_space_name"]
+
+# -- ≥ 80% of all connections that occur between 10 AM – 5 PM, Monday–Friday, are in rooms affiliated with the same group
+group_80_percent_weekday_query:
+  label: NULL
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM observation_merged o 
+    WHERE DAYOFWEEK(DATE(timeStamp)) BETWEEN 2 AND 6
+        AND TIME(timeStamp) BETWEEN '10:00:00' AND '17:00:00'
+        AND payload IN ({users_str}) 
+    ), 
+    total_session_count AS (
+        SELECT payload, COUNT(*) AS session_count
+        FROM total_sessions 
+        group by payload 
+    ),
+    space_counts AS (
+        SELECT payload, r.space_name, COUNT(*) AS number_connections 
+        FROM total_sessions t
+        JOIN region_to_coverage r ON t.sensor_id = r.sensor
+        WHERE r.space_name NOT IN ('NorthClassroom', 'SouthClassroom', 'InnerClassroom')
+        GROUP BY payload, r.space_name
+    ), 
+    space_percentages AS (
+        SELECT t.payload, sc.space_name, sc.number_connections * 1.0 / t.session_count AS percentage
+        FROM space_counts sc
+        JOIN total_session_count t ON sc.payload = t.payload
+    ),
+    top_space_percentage as (
+        select payload, space_name, percentage, ROW_NUMBER() OVER (PARTITION BY payload ORDER BY percentage DESC) AS rn
+        from space_percentages
+    )
+    SELECT payload, space_name
+    FROM top_space_percentage
+    WHERE rn = 1 AND percentage >= 0.8;
+  index: payload
+  columns: ["space_name"]
+
+# -- ≥ 80% of connected days, the device is co-located with 2+ devices affiliated (≥ 80% of its connections overlap) with majority associated group of co-located devices (where overlap each day ≥ 30 minutes)
+group_copair_query: 
+  label: NULL
+  query: |
+    WITH preprocessed_sessions AS (
+    SELECT 
+        user,
+        access_point,
+        DATE(beginning) AS day,
+        beginning,
+        end,
+        TIMESTAMPDIFF(SECOND, beginning, end) AS duration
+    FROM user_ap_trajectory
+    WHERE user IN ({users_str})
+    ),
+
+    total_connection_time AS (
+        SELECT user, SUM(duration) AS connection_time
+        FROM preprocessed_sessions
+        GROUP BY user
+    ),
+
+    raw_overlaps AS (
+        SELECT 
+            t.day AS day,
+            t.user AS target_user,
+            u.user AS other_user,
+            TIMESTAMPDIFF(SECOND, GREATEST(u.beginning, t.beginning), LEAST(u.end, t.end)) AS overlap_seconds,
+            u.access_point, 
+            r.space_name
+        FROM preprocessed_sessions t 
+        JOIN user_ap_trajectory u
+            ON u.access_point = t.access_point
+            AND u.beginning < t.end
+            AND t.beginning < u.end
+            AND u.user != t.user
+        JOIN region_to_coverage r 
+            ON u.access_point = r.sensor
+        WHERE r.space_name NOT IN ('NorthClassroom', 'SouthClassroom', 'InnerClassroom') 
+    ),
+
+    total_overlaps AS (
+        SELECT 
+            r.target_user,
+            r.other_user,
+            SUM(r.overlap_seconds) AS total_overlap_seconds,
+            t.connection_time
+        FROM raw_overlaps r
+        JOIN total_connection_time t 
+            ON r.target_user = t.user
+        GROUP BY r.target_user, r.other_user, t.connection_time
+    ),
+
+    strong_overlap_pairs AS (
+        SELECT *
+        FROM total_overlaps
+        WHERE total_overlap_seconds * 1.0 / connection_time >= 0.8
+    ),
+
+    matched_connections AS (
+        SELECT 
+            r.target_user,
+            r.space_name
+        FROM raw_overlaps r 
+        JOIN strong_overlap_pairs sop
+            ON r.target_user = sop.target_user AND r.other_user = sop.other_user
+    ),
+
+    majority_group_per_user AS (
+        SELECT 
+            target_user,
+            space_name,
+            COUNT(*) AS freq
+        FROM matched_connections
+        GROUP BY target_user, space_name
+    ),
+
+    ranked_groups AS (
+        SELECT 
+            target_user,
+            space_name, 
+            freq,
+            ROW_NUMBER() OVER (PARTITION BY mg.target_user ORDER BY mg.freq DESC, mg.space_name ASC) as rank_
+        FROM majority_group_per_user mg
+    )
+    SELECT target_user, space_name
+    FROM ranked_groups
+    WHERE rank_ = 1;
+  index: target_user
+  columns: ["space_name"]

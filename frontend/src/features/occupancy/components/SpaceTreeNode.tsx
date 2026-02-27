@@ -22,8 +22,6 @@ export default function SpaceTreeNode({ space, depth, selectedSpaceId, onSelect 
     staleTime: 5 * 60 * 1000,
   });
 
-  const hasChildren = children === undefined || children.length > 0;
-
   return (
     <div>
       <div

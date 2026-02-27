@@ -56,8 +56,8 @@ async def create_database_connection(
             detail=f"Database connection with name '{request.name}' already exists"
         )
 
-    # Encrypt password
-    encrypted_password = encrypt_password(request.password)
+    # Encrypt password if provided
+    encrypted_password = encrypt_password(request.password) if request.password else None
 
     # Create connection
     db_connection = DatabaseConnection(
@@ -214,15 +214,21 @@ async def test_database_connection(
         )
 
     try:
-        # Decrypt password
-        password = decrypt_password(connection.encrypted_password)
+        # Decrypt password if stored
+        password = decrypt_password(connection.encrypted_password) if connection.encrypted_password else ""
 
         # Create connection string
         from sqlalchemy import create_engine
         if connection.connection_type == "postgresql":
-            conn_string = f"postgresql://{connection.user}:{password}@{connection.host}:{connection.port}/{connection.database}"
+            if password:
+                conn_string = f"postgresql://{connection.user}:{password}@{connection.host}:{connection.port}/{connection.database}"
+            else:
+                conn_string = f"postgresql://{connection.user}@{connection.host}:{connection.port}/{connection.database}"
         elif connection.connection_type == "mysql":
-            conn_string = f"mysql://{connection.user}:{password}@{connection.host}:{connection.port}/{connection.database}"
+            if password:
+                conn_string = f"mysql://{connection.user}:{password}@{connection.host}:{connection.port}/{connection.database}"
+            else:
+                conn_string = f"mysql://{connection.user}@{connection.host}:{connection.port}/{connection.database}"
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

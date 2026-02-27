@@ -4,18 +4,17 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
 import { X } from 'lucide-react';
 import type { PipelineNodeType } from '../../types/nodes';
+import type { Index, Rule } from '../../types/entities';
 import { useConceptStore } from '../../stores/conceptStore';
 import { usePipelineStore } from '../../stores/pipelineStore';
-import { createIndex } from '../../api/indexes';
+import { createIndex, createDerivedIndex } from '../../api/indexes';
 import { createRule } from '../../api/rules';
-import { createFeature } from '../../api/features';
 import { createLF } from '../../api/labelingFunctions';
 import { createConceptValue } from '../../api/concepts';
 import { listConnections } from '../../../connections/api/connections';
 import SqlEditor from '../../../../shared/components/SqlEditor';
 import CodeEditor from '../../../../shared/components/CodeEditor';
 import { NewSnorkelRunForm } from '../panel/SnorkelRunPanel';
-import { NewClassifierRunForm } from '../panel/ClassifierRunPanel';
 
 interface Props {
   entityType: PipelineNodeType;
@@ -24,17 +23,16 @@ interface Props {
 
 export default function CreateEntityModal({ entityType, onClose }: Props) {
   if (entityType === 'snorkel') return <ModalWrapper title="New Snorkel Run" onClose={onClose}><NewSnorkelRunForm onClose={onClose} /></ModalWrapper>;
-  if (entityType === 'classifier') return <ModalWrapper title="New Classifier Run" onClose={onClose}><NewClassifierRunForm onClose={onClose} /></ModalWrapper>;
 
   return (
-    <ModalWrapper title={`Create ${typeLabels[entityType]}`} onClose={onClose}>
+    <ModalWrapper title={`Create ${typeLabels[entityType] ?? entityType}`} onClose={onClose}>
       <CreateForm entityType={entityType} onClose={onClose} />
     </ModalWrapper>
   );
 }
 
-const typeLabels: Record<PipelineNodeType, string> = {
-  index: 'Index', rule: 'Rule', feature: 'Feature', lf: 'Labeling Function', snorkel: 'Snorkel Run', classifier: 'Classifier', cv: 'Concept Value',
+const typeLabels: Record<string, string> = {
+  index: 'Index', rule: 'Rule', lf: 'Labeling Function', snorkel: 'Snorkel Run', cv: 'Concept Value', cvTree: 'Concept Value',
 };
 
 function ModalWrapper({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
@@ -54,41 +52,113 @@ function ModalWrapper({ title, onClose, children }: { title: string; onClose: ()
 function CreateForm({ entityType, onClose }: { entityType: PipelineNodeType; onClose: () => void }) {
   const cId = useConceptStore((s) => s.activeConcept?.c_id);
   const conceptValues = useConceptStore((s) => s.conceptValues);
-  const activeLevel = useConceptStore((s) => s.activeLevel);
-  const filteredCVs = conceptValues.filter((cv) => cv.level === activeLevel);
+  const selectedCV = useConceptStore((s) => s.selectedCV);
+  const allEntities = useConceptStore((s) => s.allEntities);
   const queryClient = useQueryClient();
   const nodes = usePipelineStore((s) => s.nodes);
 
-  const { data: connections } = useQuery({ queryKey: ['connections'], queryFn: listConnections, enabled: entityType === 'index' });
+  // Index mode: root CV → SQL index owned by CV, child CV → derived, no CV → SQL (backward compat)
+  const isRootCVSelected = !!selectedCV && selectedCV.parent_cv_id == null;
+  const isChildCVSelected = !!selectedCV && selectedCV.parent_cv_id != null;
+  const isDerivedMode = entityType === 'index' && isChildCVSelected;
+  const isSqlMode = entityType === 'index' && (isRootCVSelected || !selectedCV);
 
-  const indexes = nodes.filter((n) => n.data.entityType === 'index');
-  const rules = nodes.filter((n) => n.data.entityType === 'rule');
+  const { data: connections } = useQuery({ queryKey: ['connections'], queryFn: listConnections, enabled: isSqlMode });
+
+  // --- Inferred context for all entity types ---
+
+  // Indexes on canvas (for rule creation)
+  const canvasIndexes = nodes
+    .filter((n) => n.data.entityType === 'index')
+    .map((n) => n.data.entity as Index);
+
+  // Rules on canvas (for LF creation)
+  const canvasRules = nodes
+    .filter((n) => n.data.entityType === 'rule')
+    .map((n) => n.data.entity as Rule);
+
+  // Applicable CVs for LF: children of selectedCV, or root CVs if no selection
+  const applicableCVs = selectedCV
+    ? conceptValues.filter((cv) => cv.parent_cv_id === selectedCV.cv_id)
+    : conceptValues.filter((cv) => cv.parent_cv_id == null);
+
+  // For derived index: auto-infer parent from CV tree
+  const parentSnorkelJobs = (() => {
+    if (!selectedCV || !selectedCV.parent_cv_id || !allEntities) return [];
+    // Find all indexes belonging to the parent CV (SQL or derived)
+    const parentIndexes = allEntities.indexes.filter(
+      (i) => i.cv_id === selectedCV.parent_cv_id
+    );
+    const parentIndexIds = new Set(parentIndexes.map((i) => i.index_id));
+    return allEntities.snorkelJobs.filter(
+      (sj) => parentIndexIds.has(sj.index_id) && sj.status === 'COMPLETED'
+    );
+  })();
 
   const { register, handleSubmit } = useForm<Record<string, string>>();
-  const [selectedCvIds, setSelectedCvIds] = useState<number[]>([]);
+  const [outputType, setOutputType] = useState<'softmax' | 'argmax' | 'passthrough'>('softmax');
+  const [threshold, setThreshold] = useState(0.5);
 
   const mutation = useMutation({
     mutationFn: async (values: Record<string, string>) => {
       if (!cId) throw new Error('No concept selected');
       switch (entityType) {
         case 'index':
-          return createIndex(cId, { name: values.name, conn_id: Number(values.conn_id), sql_query: values.sql_query });
-        case 'rule':
-          return createRule(cId, { name: values.name, index_id: Number(values.index_id), sql_query: values.sql_query, index_column: values.index_column || undefined });
-        case 'feature':
-          return createFeature(cId, { name: values.name, index_id: Number(values.index_id), sql_query: values.sql_query, index_column: values.index_column || undefined });
-        case 'lf':
-          return createLF(cId, { name: values.name, rule_id: Number(values.rule_id), applicable_cv_ids: selectedCvIds, code: values.code || undefined });
-        case 'cv':
-          return createConceptValue(cId, { name: values.name, description: values.description || undefined, level: values.level ? Number(values.level) : 1, display_order: values.display_order ? Number(values.display_order) : undefined });
+          if (isDerivedMode && selectedCV) {
+            return createDerivedIndex(cId, {
+              name: values.name,
+              cv_id: selectedCV.cv_id,
+              parent_snorkel_job_id: parentSnorkelJobs.length === 1
+                ? parentSnorkelJobs[0].job_id
+                : (values.parent_snorkel_job_id ? Number(values.parent_snorkel_job_id) : undefined),
+              label_filter: outputType === 'softmax'
+                ? { labels: { [String(selectedCV.cv_id)]: { min_confidence: threshold } } }
+                : outputType === 'argmax'
+                ? { labels: { [String(selectedCV.cv_id)]: {} } }
+                : undefined,
+              output_type: outputType,
+            });
+          }
+          return createIndex(cId, {
+            name: values.name,
+            conn_id: Number(values.conn_id),
+            key_column: values.key_column,
+            sql_query: values.sql_query,
+            ...(isRootCVSelected && selectedCV ? { cv_id: selectedCV.cv_id } : {}),
+          });
+        case 'rule': {
+          // Auto-infer index: use the single index if only one, otherwise from form
+          const indexId = canvasIndexes.length === 1
+            ? canvasIndexes[0].index_id
+            : Number(values.index_id);
+          return createRule(cId, { name: values.name, index_id: indexId, sql_query: values.sql_query });
+        }
+        case 'lf': {
+          // Rule is NOT set here — user connects Rule→LF via edge on canvas
+          const cvIds = applicableCVs.map((cv) => cv.cv_id);
+          return createLF(cId, { name: values.name, applicable_cv_ids: cvIds, code: values.code || undefined });
+        }
+        case 'cv': {
+          // Auto-infer parent and level from tree context
+          const parentCvId = selectedCV ? selectedCV.cv_id : undefined;
+          const level = selectedCV ? selectedCV.level + 1 : 1;
+          return createConceptValue(cId, {
+            name: values.name,
+            description: values.description || undefined,
+            level,
+            display_order: values.display_order ? Number(values.display_order) : undefined,
+            parent_cv_id: parentCvId,
+          });
+        }
         default:
           throw new Error('Unknown type');
       }
     },
     onSuccess: () => {
-      const keyMap: Record<string, string> = { index: 'indexes', rule: 'rules', feature: 'features', lf: 'lfs', snorkel: 'snorkelJobs', classifier: 'classifierJobs', cv: 'conceptValues' };
+      const keyMap: Record<string, string> = { index: 'indexes', rule: 'rules', lf: 'lfs', snorkel: 'snorkelJobs', cv: 'conceptValues' };
       const key = keyMap[entityType];
       queryClient.invalidateQueries({ queryKey: [key, cId] });
+      if (entityType === 'cv') queryClient.invalidateQueries({ queryKey: ['cvTree', cId] });
       toast.success(`${typeLabels[entityType]} created`);
       onClose();
     },
@@ -102,80 +172,129 @@ function CreateForm({ entityType, onClose }: { entityType: PipelineNodeType; onC
         <input {...register('name', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" />
       </div>
 
-      {entityType === 'index' && (
-        <div>
-          <label className="block text-xs font-medium text-gray-700 mb-1">Connection</label>
-          <select {...register('conn_id', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
-            <option value="">Select...</option>
-            {connections?.map((c) => <option key={c.conn_id} value={c.conn_id}>{c.name}</option>)}
-          </select>
-        </div>
-      )}
-
-      {(entityType === 'rule' || entityType === 'feature') && (
+      {/* ── Index at root: SQL only ── */}
+      {isSqlMode && (
         <>
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Index</label>
-            <select {...register('index_id', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
+            <label className="block text-xs font-medium text-gray-700 mb-1">Connection</label>
+            <select {...register('conn_id', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
               <option value="">Select...</option>
-              {indexes.map((n) => <option key={n.id} value={(n.data.entity as { index_id: number }).index_id}>{n.data.label}</option>)}
+              {connections?.map((c) => <option key={c.conn_id} value={c.conn_id}>{c.name}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Index Column</label>
-            <input {...register('index_column')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md" placeholder="Optional" />
+            <label className="block text-xs font-medium text-gray-700 mb-1">Key Column</label>
+            <input {...register('key_column', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md" placeholder='e.g. "user"' />
+            <p className="text-[10px] text-gray-400 mt-0.5">Column containing unique entity identifiers</p>
           </div>
+          <SqlEditor label="SQL Query" {...register('sql_query', { required: true })} />
         </>
       )}
 
+      {/* ── Index inside a child CV: derived mode ── */}
+      {isDerivedMode && selectedCV && (
+        <>
+          <ReadOnlyField label="Concept Value" value={selectedCV.name} />
+
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Parent Snorkel Job</label>
+            {parentSnorkelJobs.length === 1 ? (
+              <ReadOnlyField value={`Snorkel #${parentSnorkelJobs[0].job_id}`} />
+            ) : parentSnorkelJobs.length > 1 ? (
+              <select {...register('parent_snorkel_job_id', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
+                <option value="">Select snorkel job...</option>
+                {parentSnorkelJobs.map((sj) => (
+                  <option key={sj.job_id} value={sj.job_id}>Snorkel #{sj.job_id}</option>
+                ))}
+              </select>
+            ) : (
+              <p className="text-xs text-amber-600">No completed snorkel job on parent CV. Run snorkel on the parent first.</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Output Type</label>
+            <select
+              value={outputType}
+              onChange={(e) => setOutputType(e.target.value as 'softmax' | 'argmax' | 'passthrough')}
+              className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md"
+            >
+              <option value="softmax">Softmax (probability threshold)</option>
+              <option value="argmax">Argmax (top prediction)</option>
+              <option value="passthrough">Pass-through (all entities)</option>
+            </select>
+            <p className="text-[10px] text-gray-400 mt-0.5">How predictions from the parent Snorkel job are interpreted</p>
+          </div>
+
+          {outputType === 'softmax' && (
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Min Confidence</label>
+              <input
+                type="number"
+                step="0.05"
+                min="0"
+                max="1"
+                value={threshold}
+                onChange={(e) => setThreshold(Number(e.target.value))}
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <p className="text-[10px] text-gray-400 mt-0.5">Entities with probability &ge; this value are included</p>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── Rule: auto-infer index if only one ── */}
+      {entityType === 'rule' && (
+        <>
+          {canvasIndexes.length === 1 ? (
+            <ReadOnlyField label="Index" value={canvasIndexes[0].name} />
+          ) : canvasIndexes.length > 1 ? (
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Index</label>
+              <select {...register('index_id', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
+                <option value="">Select...</option>
+                {canvasIndexes.map((idx) => <option key={idx.index_id} value={idx.index_id}>{idx.name}</option>)}
+              </select>
+            </div>
+          ) : (
+            <p className="text-xs text-amber-600">No indexes found. Create one first.</p>
+          )}
+          <SqlEditor label="SQL Query" {...register('sql_query', { required: true })} />
+        </>
+      )}
+
+      {/* ── LF: rule set via edge on canvas, labels auto-inferred ── */}
       {entityType === 'lf' && (
         <>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Rule</label>
-            <select {...register('rule_id', { required: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md">
-              <option value="">Select...</option>
-              {rules.map((n) => <option key={n.id} value={(n.data.entity as { r_id: number }).r_id}>{n.data.label}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Applicable Labels</label>
-            <div className="space-y-1 border border-gray-200 rounded p-2 max-h-32 overflow-y-auto">
-              {filteredCVs.map((cv) => (
-                <label key={cv.cv_id} className="flex items-center gap-2 text-sm">
-                  <input type="checkbox" checked={selectedCvIds.includes(cv.cv_id)} onChange={(e) => {
-                    setSelectedCvIds(e.target.checked ? [...selectedCvIds, cv.cv_id] : selectedCvIds.filter((id) => id !== cv.cv_id));
-                  }} />
-                  {cv.name}
-                </label>
-              ))}
-            </div>
-          </div>
+          {applicableCVs.length > 0 && (
+            <ReadOnlyField
+              label="Applicable Labels"
+              value={applicableCVs.map((cv) => cv.name).join(', ')}
+              hint={`Auto-assigned — all children of ${selectedCV?.name ?? 'root'}`}
+            />
+          )}
+          <CodeEditor label="Python Code (optional, auto-generates if empty)" {...register('code')} />
         </>
       )}
 
+      {/* ── CV: auto-infer parent + level from tree ── */}
       {entityType === 'cv' && (
         <>
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Description</label>
             <input {...register('description')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Optional" />
           </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Level</label>
-            <input type="number" defaultValue={1} {...register('level')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" />
-          </div>
+          {selectedCV ? (
+            <ReadOnlyField label="Parent" value={selectedCV.name} hint={`Level ${selectedCV.level + 1}`} />
+          ) : (
+            <ReadOnlyField label="Parent" value="None (root)" hint="Level 1" />
+          )}
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Display Order</label>
             <input type="number" {...register('display_order')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Optional" />
           </div>
         </>
-      )}
-
-      {(entityType === 'index' || entityType === 'rule' || entityType === 'feature') && (
-        <SqlEditor label="SQL Query" {...register('sql_query', { required: true })} />
-      )}
-
-      {entityType === 'lf' && (
-        <CodeEditor label="Python Code (optional, auto-generates if empty)" {...register('code')} />
       )}
 
       <div className="flex justify-end gap-3 pt-2">
@@ -185,5 +304,19 @@ function CreateForm({ entityType, onClose }: { entityType: PipelineNodeType; onC
         </button>
       </div>
     </form>
+  );
+}
+
+function ReadOnlyField({ label, value, hint }: { label?: string; value: string; hint?: string }) {
+  return (
+    <div>
+      {label && <label className="block text-xs font-medium text-gray-700 mb-1">{label}</label>}
+      <input
+        value={value}
+        readOnly
+        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-md bg-gray-50 text-gray-500 cursor-not-allowed"
+      />
+      {hint && <p className="text-[10px] text-gray-400 mt-0.5">{hint}</p>}
+    </div>
   );
 }

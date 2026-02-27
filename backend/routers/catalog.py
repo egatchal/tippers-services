@@ -11,6 +11,7 @@ from backend.schemas import (
     ConceptValueCreate,
     ConceptValueUpdate,
     ConceptValueResponse,
+    ConceptValueTreeNode,
     AssetCatalogResponse,
     CatalogIndexItem,
     CatalogRuleItem
@@ -202,11 +203,25 @@ async def create_concept_value(
             detail=f"Concept value with name '{request.name}' already exists for concept {c_id}"
         )
 
+    # Validate parent_cv_id if provided
+    if request.parent_cv_id is not None:
+        parent_cv = db.query(ConceptValue).filter(
+            ConceptValue.cv_id == request.parent_cv_id,
+            ConceptValue.c_id == c_id
+        ).first()
+        if not parent_cv:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Parent concept value {request.parent_cv_id} not found in concept {c_id}"
+            )
+
     concept_value = ConceptValue(
         c_id=c_id,
         name=request.name,
         description=request.description,
-        display_order=request.display_order
+        display_order=request.display_order,
+        level=request.level,
+        parent_cv_id=request.parent_cv_id,
     )
 
     db.add(concept_value)
@@ -231,6 +246,49 @@ async def list_concept_values(
     ).order_by(ConceptValue.display_order, ConceptValue.cv_id).all()
 
     return values
+
+
+@router.get("/{c_id}/values/tree", response_model=List[ConceptValueTreeNode])
+async def get_concept_value_tree(
+    c_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Get concept values as a nested tree structure.
+
+    Root nodes (parent_cv_id=NULL) appear at the top level.
+    Children are nested recursively under their parents.
+
+    - **c_id**: Concept ID
+    """
+    all_values = db.query(ConceptValue).filter(
+        ConceptValue.c_id == c_id
+    ).order_by(ConceptValue.display_order, ConceptValue.cv_id).all()
+
+    # Build tree in-memory from flat list
+    nodes_by_id = {}
+    for v in all_values:
+        nodes_by_id[v.cv_id] = ConceptValueTreeNode(
+            cv_id=v.cv_id,
+            c_id=v.c_id,
+            name=v.name,
+            description=v.description,
+            display_order=v.display_order,
+            level=v.level,
+            parent_cv_id=v.parent_cv_id,
+            created_at=v.created_at,
+            children=[],
+        )
+
+    roots = []
+    for v in all_values:
+        node = nodes_by_id[v.cv_id]
+        if v.parent_cv_id is not None and v.parent_cv_id in nodes_by_id:
+            nodes_by_id[v.parent_cv_id].children.append(node)
+        else:
+            roots.append(node)
+
+    return roots
 
 
 @router.get("/{c_id}/values/{cv_id}", response_model=ConceptValueResponse)

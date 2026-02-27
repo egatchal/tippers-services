@@ -4,11 +4,11 @@ import type { PipelineNodeType } from '../../types/nodes';
 const typeLabels: Record<PipelineNodeType, string> = {
   index: 'Index',
   rule: 'Rule',
-  feature: 'Feature',
   lf: 'Labeling Function',
   snorkel: 'Snorkel Run',
-  classifier: 'Classifier',
   cv: 'Concept Value',
+  cvTree: 'Concept Value',
+  placeholder: 'Placeholder',
 };
 
 interface Props {

@@ -42,6 +42,7 @@ class ConceptValueCreate(BaseModel):
     description: Optional[str] = Field(None, description="Label description")
     display_order: Optional[int] = Field(None, description="Display order in UI")
     level: int = Field(default=1, description="Classification level (1=top-level, 2=sub-level, etc.)")
+    parent_cv_id: Optional[int] = Field(None, description="Parent concept value ID for hierarchical classification")
 
 
 class ConceptValueUpdate(BaseModel):
@@ -50,6 +51,7 @@ class ConceptValueUpdate(BaseModel):
     description: Optional[str] = None
     display_order: Optional[int] = None
     level: Optional[int] = None
+    parent_cv_id: Optional[int] = None
 
 
 class ConceptValueResponse(BaseModel):
@@ -60,10 +62,31 @@ class ConceptValueResponse(BaseModel):
     description: Optional[str]
     display_order: Optional[int]
     level: int = 1
+    parent_cv_id: Optional[int] = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class ConceptValueTreeNode(BaseModel):
+    """Recursive tree node for hierarchical concept values."""
+    cv_id: int
+    c_id: int
+    name: str
+    description: Optional[str]
+    display_order: Optional[int]
+    level: int = 1
+    parent_cv_id: Optional[int] = None
+    created_at: datetime
+    children: List["ConceptValueTreeNode"] = []
+
+    class Config:
+        from_attributes = True
+
+
+# Resolve forward reference for recursive tree node
+ConceptValueTreeNode.model_rebuild()
 
 
 # ============================================================================
@@ -78,7 +101,7 @@ class DatabaseConnectionCreate(BaseModel):
     port: int
     database: str
     user: str
-    password: str = Field(..., description="Password (will be encrypted)")
+    password: Optional[str] = Field(None, description="Password (will be encrypted)")
 
 
 class DatabaseConnectionUpdate(BaseModel):
@@ -112,23 +135,27 @@ class DatabaseConnectionResponse(BaseModel):
 # ============================================================================
 
 class IndexCreate(BaseModel):
-    """Schema for creating an index."""
+    """Schema for creating a SQL index."""
     name: str = Field(..., description="Index name")
-    conn_id: int = Field(..., description="Database connection ID")
-    sql_query: str = Field(..., description="SQL query to execute")
+    conn_id: Optional[int] = Field(None, description="Database connection ID (required for SQL indexes)")
+    key_column: str = Field(..., description="Column containing unique entity identifiers (e.g., 'user')")
+    sql_query: Optional[str] = Field(None, description="SQL query to execute (required for SQL indexes)")
     query_template_params: Optional[Dict[str, Any]] = Field(None, description="Jinja2 template parameters")
     partition_type: Optional[str] = Field(None, description="Partition type: time, id_range, categorical")
     partition_config: Optional[Dict[str, Any]] = Field(None, description="Partition configuration")
+    cv_id: Optional[int] = Field(None, description="Concept value ID (root CVs only — assigns SQL index directly to a CV)")
 
 
 class IndexUpdate(BaseModel):
     """Schema for updating an index."""
     name: Optional[str] = None
     conn_id: Optional[int] = None
+    key_column: Optional[str] = None
     sql_query: Optional[str] = None
     query_template_params: Optional[Dict[str, Any]] = None
     partition_type: Optional[str] = None
     partition_config: Optional[Dict[str, Any]] = None
+    parent_snorkel_job_id: Optional[int] = None
 
 
 class IndexResponse(BaseModel):
@@ -137,7 +164,8 @@ class IndexResponse(BaseModel):
     c_id: int
     conn_id: Optional[int]
     name: str
-    sql_query: str
+    key_column: Optional[str] = None
+    sql_query: Optional[str] = None
     query_template_params: Optional[Dict[str, Any]]
     partition_type: Optional[str]
     partition_config: Optional[Dict[str, Any]]
@@ -146,6 +174,13 @@ class IndexResponse(BaseModel):
     materialized_at: Optional[datetime]
     row_count: Optional[int]
     column_stats: Optional[Dict[str, Any]] = None
+    source_type: str = "sql"
+    cv_id: Optional[int] = None
+    parent_index_id: Optional[int] = None
+    parent_snorkel_job_id: Optional[int] = None
+    label_filter: Optional[Dict[str, Any]] = None
+    filtered_count: Optional[int] = None
+    output_type: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -158,6 +193,29 @@ class IndexMaterializeResponse(BaseModel):
     index_id: int
     dagster_run_id: str
     status: str
+
+
+class DerivedIndexCreate(BaseModel):
+    """Schema for creating a derived index (pipeline input for a CV node)."""
+    name: str = Field(..., description="Index name")
+    cv_id: int = Field(..., description="Concept value ID this derived index belongs to")
+    parent_index_id: Optional[int] = Field(None, description="Parent SQL index ID (for root derived)")
+    parent_snorkel_job_id: Optional[int] = Field(None, description="Parent Snorkel job ID (for child derived)")
+    label_filter: Optional[Dict[str, Any]] = Field(None, description="Label filter config, e.g. {\"labels\": {\"5\": {\"min_confidence\": 0.8}}}")
+    output_type: str = Field(default="softmax", description="Output type: 'softmax' (probability vectors) or 'hard_labels' (discrete class labels)")
+
+
+class LabelFilterUpdate(BaseModel):
+    """Schema for updating a derived index's label filter."""
+    label_filter: Dict[str, Any] = Field(..., description="New label filter config")
+
+
+class EntityPreviewResponse(BaseModel):
+    """Schema for previewing entities from an index."""
+    index_id: int
+    source_type: str
+    total_count: int
+    entities: List[Dict[str, Any]]
 
 
 # ============================================================================
@@ -223,7 +281,7 @@ class RuleMaterializeResponse(BaseModel):
 class LabelingFunctionCreate(BaseModel):
     """Schema for creating a labeling function (custom Python only)."""
     name: str = Field(..., description="LF name")
-    rule_id: int = Field(..., description="Rule ID that provides features")
+    rule_id: Optional[int] = Field(None, description="Rule ID that provides features (set via canvas edge if omitted)")
     applicable_cv_ids: List[int] = Field(..., description="Concept value IDs this LF can vote on")
     code: Optional[str] = Field(None, description="Python code for labeling function. If omitted, a template is auto-generated.")
     allowed_imports: List[str] = Field(default_factory=list, description="Allowed import modules")
@@ -233,6 +291,7 @@ class LabelingFunctionCreate(BaseModel):
 class LabelingFunctionUpdate(BaseModel):
     """Schema for updating a labeling function."""
     name: Optional[str] = None
+    rule_id: Optional[int] = None
     is_active: Optional[bool] = None
     lf_config: Optional[Dict[str, Any]] = None
     applicable_cv_ids: Optional[List[int]] = None
@@ -243,7 +302,7 @@ class LabelingFunctionResponse(BaseModel):
     lf_id: int
     c_id: int
     applicable_cv_ids: List[int]
-    rule_id: int
+    rule_id: Optional[int]
     name: str
     version: int
     parent_lf_id: Optional[int]
@@ -283,9 +342,9 @@ class SnorkelConfig(BaseModel):
 
 class SnorkelRunRequest(BaseModel):
     """Schema for triggering Snorkel training."""
-    selectedIndex: int = Field(..., description="Index ID to use as dataset")
+    selectedIndex: Optional[int] = Field(None, description="Index ID to use as dataset (set via canvas edge if omitted)")
     selectedRules: List[int] = Field(default_factory=list, description="Rule IDs to include")
-    selectedLFs: List[int] = Field(..., description="Labeling function IDs to apply")
+    selectedLFs: List[int] = Field(default_factory=list, description="Labeling function IDs to apply (set via canvas edges if empty)")
     snorkel: SnorkelConfig
 
 
@@ -293,7 +352,7 @@ class SnorkelJobResponse(BaseModel):
     """Schema for Snorkel job response."""
     job_id: int
     c_id: int
-    index_id: int
+    index_id: Optional[int]
     rule_ids: Optional[List[int]]
     lf_ids: Optional[List[int]]
     config: Optional[Dict[str, Any]]

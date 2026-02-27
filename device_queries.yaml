@@ -1,0 +1,626 @@
+# -- > 15 hours average time of connection to 1 access point/room on 10+ days (Always on static device)
+static_fifteen_hour_avg_query:
+  label: STATIC
+  query: |
+    WITH agg_data AS (
+    SELECT 
+        user, 
+        AVG(TIMESTAMPDIFF(SECOND, beginning, end)) / 3600 AS avg_hours, 
+        COUNT(DISTINCT DATE(beginning)) AS distinct_date, 
+        COUNT(DISTINCT access_point) AS distinct_ap
+    FROM user_ap_trajectory
+    WHERE user IN ({users_str})
+    GROUP BY user
+    )
+    SELECT *
+    FROM agg_data
+    WHERE 
+        avg_hours >= 15 
+        AND distinct_date >= 10 
+        AND distinct_ap = 1;
+  index: user
+  columns: ["avg_hours", "distinct_date", "distinct_ap"]
+
+# -- >= 50 connections to only 1 distinct access point 
+static_50_connections_1_ap_query:
+  label: STATIC
+  query: | 
+    WITH total_connections as (
+    select user, count(*) as record_count, count(distinct access_point) distinct_ap
+    from user_ap_trajectory u
+    WHERE user IN ({users_str})
+    group by user
+    )
+    SELECT *
+    from total_connections
+    where record_count >= 50 AND distinct_ap = 1; 
+  index: user
+  columns: ["record_count", "distinct_ap"]
+
+# -- at least 80% of connections are short irregular sessions <= 2 hours to 1 access point (Intermittent static device)
+static_short_irregular_sessions_query:
+  label: STATIC
+  query: | 
+    WITH connections as (
+    select
+        user,  
+        SUM(CASE WHEN TIMESTAMPDIFF(SECOND, beginning, end) / 3600 <= 2 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as connection_count, 
+        Count(distinct(access_point)) as distinct_ap 
+    from user_ap_trajectory
+    WHERE user IN ({users_str})
+    group by user
+    )
+    SELECT *
+    FROM connections 
+    where connection_count >= 0.8 AND distinct_ap = 1; 
+  index: user
+  columns: ["connection_count", distinct_ap]
+
+# -- If the device connects at least once between 10 PM and 5 AM on ≥ 80% of its connected days, and is connected on ≥ 10 nights total
+static_late_night_query:
+  label: STATIC
+  query: | 
+    WITH connected_days AS (
+    SELECT 
+        user,
+        COUNT(DISTINCT DATE(beginning)) AS total_days
+    FROM user_ap_trajectory
+    WHERE user IN ({users_str})
+    GROUP BY user
+    ),
+    night_days AS (
+        SELECT 
+            user,
+            COUNT(DISTINCT DATE(beginning)) AS night_days
+        FROM user_ap_trajectory
+        WHERE user IN ({users_str}) AND (TIME(end) >= '22:00:00' OR TIME(beginning) <= '05:00:00')
+        GROUP BY user
+    )
+    SELECT *
+    FROM connected_days c
+    JOIN night_days n ON c.user = n.user
+    WHERE n.night_days * 1.0 / c.total_days >= 0.8 AND c.total_days >= 10;
+  index: user
+  columns: ["total_days", "night_days"]
+
+# -- Connected to rooms of a single room type (office, meeting or conference room) and connected to only <= 2 rooms. This pattern occurs over at least 10 distinct days and accounts for ≥ 80% of total connected days.
+static_single_room_type_query:
+  label: STATIC
+  query: |
+    WITH per_day_info AS (
+    SELECT 
+        user, 
+        DATE(u.beginning) AS day,
+        COUNT(DISTINCT u.space_id) AS distinct_space,
+        COUNT(DISTINCT sm.type) AS room_type_count
+    FROM user_location_trajectory_FINE_V2 u
+    JOIN space s ON u.space_id = s.space_id 
+    JOIN space_metadata sm ON sm.building_room = s.building_room
+    WHERE user IN ({users_str})
+    GROUP BY user, DATE(u.beginning)
+    ),
+    total_days AS (
+        SELECT user, COUNT(*) AS total_count 
+        FROM per_day_info
+        group by user
+    ),
+    matching_days AS (
+        SELECT user, COUNT(*) AS matching_count
+        FROM per_day_info
+        WHERE distinct_space <= 2 AND room_type_count = 1
+        group by user
+    )
+    SELECT *
+    FROM matching_days m, total_days t
+    WHERE m.user = t.user AND m.matching_count * 1.0 / t.total_count >= 0.8 AND m.matching_count >= 10; 
+  index: user
+  columns: ["matching_count", "total_count"]
+
+# -- Device is connected during off-hours (10 PM – 5 AM) for at least 3 distinct days, and ≥ 80% of its total connections fall within this off-hours window (didn't implement yet: 1 hour minimum discussion.) 
+static_off_hour_query:
+  label: STATIC
+  query: |
+    WITH total_days AS (
+        select user, count(*) as total_count
+        from user_location_trajectory_FINE_V2 u
+        WHERE user IN ({users_str})
+        group by user
+    ),
+    matched_days AS (
+        SELECT user, count(*) as matched_count, count(distinct date(beginning)) as distinct_date 
+        FROM user_location_trajectory_FINE_V2 u
+        WHERE 
+            (
+                TIME(beginning) >= '22:00:00' OR TIME(end) <= '05:00:00'
+            )
+          AND user IN ({users_str})
+        group by user 
+    )
+    select m.user, matched_count, distinct_date, total_count
+    from matched_days m, total_days t
+    where m.user = t.user AND m.distinct_date >= 3  AND matched_count * 1.0 / t.total_count >= 0.8;  
+  index: user
+  columns: ["matched_count", "distinct_date", "total_count"]
+
+# -- Laptop is co-paired with another device (typically a phone) if ≥ 80% of its connections overlap in time and location (same access point or nearby) with the other device’s connections. Connects to fewer rooms/ access points than its co-paired device. 
+laptop_copair_query:
+  label: LAPTOP
+  query: |
+    WITH all_users_and_sessions AS (
+    -- Get all user sessions with their associated space_id
+    SELECT
+        user,
+        beginning,
+        end,
+        space_id
+    FROM
+        user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ),
+    user_stats_all_users AS (
+        -- Calculate total session count and distinct space count for every user
+        SELECT
+            user,
+            COUNT(*) AS total_count,
+            COUNT(DISTINCT space_id) AS distinct_space
+        FROM
+            user_location_trajectory_FINE_V2
+        GROUP BY
+            user
+    ),
+    overlapping_sessions_per_target AS (
+        -- Find overlaps between each potential target_user and every other user
+        SELECT
+            t.user AS target_user,
+            u.user AS other_user,
+            COUNT(u.user) AS overlap_count
+        FROM
+            all_users_and_sessions t
+        JOIN
+            user_location_trajectory_FINE_V2 u
+            ON t.user != u.user -- Ensure it's a different user
+            AND t.space_id = u.space_id
+            AND t.beginning < u.end
+            AND u.beginning < t.end
+        GROUP BY
+            t.user,
+            u.user
+    ),
+    qualified_copairs AS (
+        -- Identify copairs that meet the overlap percentage and distinct space/total count conditions
+        SELECT
+            os.target_user,
+            os.other_user
+        FROM
+            overlapping_sessions_per_target os
+        JOIN
+            user_stats_all_users ts ON os.target_user = ts.user -- Stats for the target user
+        JOIN
+            user_stats_all_users ots ON os.other_user = ots.user -- Stats for the other (potential copair) user
+        WHERE
+            (os.overlap_count * 1.0 / ts.total_count) >= 0.8
+            AND (ts.distinct_space < ots.distinct_space OR ts.total_count < ots.total_count)
+    )
+    SELECT
+        *
+    FROM
+        qualified_copairs;
+  index: target_user
+  columns: ["other_user"]
+
+# -- Connected to average 1.5 - 5 hour daily sessions on 80% of all days this device connected
+laptop_daily_avg_query: 
+  label: LAPTOP
+  query: |
+    WITH total_sessions AS (
+        SELECT * 
+        FROM user_location_trajectory_FINE_V2
+        WHERE user IN ({users_str})
+    ), 
+    daily_avg_connection_time AS (
+        SELECT 
+            user, 
+            DATE(beginning) AS day,
+            SUM(TIMESTAMPDIFF(SECOND, beginning, end)) / COUNT(*) / 3600.0 AS avg_hours_per_connection
+        FROM total_sessions
+        GROUP BY user, DATE(beginning)
+    ),
+
+    matched_days AS (
+        SELECT user, day
+        FROM daily_avg_connection_time
+        WHERE avg_hours_per_connection BETWEEN 1.5 AND 5
+    ),
+
+    day_counts AS (
+        SELECT 
+            d.user,
+            COUNT(m.day) * 1.0 / COUNT(d.day) AS qualifying_day_ratio,
+            COUNT(d.day) AS total_days
+        FROM daily_avg_connection_time d
+        LEFT JOIN matched_days m ON d.user = m.user AND d.day = m.day
+        GROUP BY d.user
+    )
+    SELECT *
+    FROM day_counts
+    WHERE qualifying_day_ratio >= 0.8 AND total_days >= 1;
+  index: user
+  columns: ["qualifying_day_ratio", "total_days"]
+
+# -- ≥ 80% of total connection events occurred in valid room types (conference room, office, meeting room, student lab)
+laptop_valid_room_type_query: 
+  label: LAPTOP
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ), 
+    valid_room_sessions AS (
+        SELECT t.user, COUNT(*) AS valid_count 
+        FROM total_sessions t
+        JOIN space s ON t.space_id = s.space_id 
+        JOIN space_metadata sm ON sm.building_room = s.building_room
+        WHERE sm.type IN ('conference room', 'office', 'meeting room', 'student lab')
+        GROUP BY t.user
+    ),
+    total_connection_count AS (
+        SELECT user, COUNT(*) AS total_count
+        FROM total_sessions
+        GROUP BY user
+    ),
+    connection_percentage AS (
+        SELECT 
+            t.user, 
+            v.valid_count * 1.0 / NULLIF(t.total_count, 0) AS percentage
+        FROM total_connection_count t
+        JOIN valid_room_sessions v ON t.user = v.user
+    )
+    SELECT *
+    FROM connection_percentage
+    WHERE percentage >= 0.8;
+  index: user
+  columns: ["percentage"]
+
+# -- Device is used for at least 3 days, and on at least 80% of those days, it connects to between 2 and 6 unique rooms.
+laptop_unique_room_query: 
+  label: LAPTOP
+  query: |
+    WITH total_sessions AS (
+        SELECT * 
+        FROM user_location_trajectory_FINE_V2
+        WHERE user IN ({users_str})
+    ), 
+    total_days AS (
+        SELECT user, COUNT(distinct date(beginning)) AS total_day_count
+        FROM total_sessions
+        group by user
+    ),
+    unique_room_count AS (
+        select user, date(beginning) as day, count(distinct space_id) as count
+        from total_sessions 
+        group by user, date(beginning)
+        having count(distinct space_id) >= 2 AND count(distinct space_id) < 6
+    ),
+    unique_room_percentage AS (
+        SELECT 
+            u.user, 
+            COUNT(u.day) * 1.0 / MAX(t.total_day_count) AS percentage,
+            MAX(t.total_day_count) AS day_count
+        FROM 
+            unique_room_count u, total_days t
+        where u.user = t.user
+        group by u.user
+    )
+    select *
+    from unique_room_percentage u 
+    where u.percentage >= 0.8 AND u.day_count >= 3; 
+  index: user
+  columns: ["percentage", "day_count"]
+
+# -- 80% of total connections fall on weekdays where the total connected duration is between 9 AM and 9 PM.
+laptop_total_connected_duration_query: 
+  label: LAPTOP
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ), 
+    total_connection_count AS (
+        SELECT user, COUNT(*) AS total_count
+        FROM total_sessions
+        group by user
+    ),
+    valid_connections as (
+        SELECT user
+        FROM total_sessions
+        WHERE 
+            DAYOFWEEK(DATE(beginning)) BETWEEN 1 AND 5 -- Weekdays
+            AND TIME(beginning) >= TIME '09:00:00'
+            AND TIME(end) <= TIME '21:00:00'
+    ),
+    valid_connection_count AS (
+        SELECT user, COUNT(*) AS valid_count
+        FROM valid_connections
+        GROUP BY user
+    ),
+    valid_connection_percentage AS (
+        SELECT 
+            t.user, 
+            v.valid_count * 1.0 / NULLIF(t.total_count, 0) AS percentage
+        FROM total_connection_count t
+        JOIN valid_connection_count v ON t.user = v.user
+    )
+    SELECT *
+    FROM valid_connection_percentage 
+    WHERE percentage >= 0.8;
+  index: user
+  columns: ["percentage"]
+
+# -- Phone is co-paired with another device (typically a phone) if ≥ 80% of its connections overlap in time and location (same access point or nearby) with the other device’s connections. Connects to more rooms/ access points than its co-paired device. 
+phone_copair_query:
+  label: PHONE
+  query: |
+    WITH all_user_sessions_with_space AS (
+    SELECT
+        user,
+        beginning,
+        end,
+        space_id
+    FROM
+        user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ),
+    user_stats_all_users AS (
+        SELECT
+            user,
+            COUNT(*) AS total_count,
+            COUNT(DISTINCT space_id) AS distinct_space
+        FROM
+            user_location_trajectory_FINE_V2
+        GROUP BY
+            user
+    ),
+    overlapping_sessions_and_stats_per_target_and_other AS (
+        SELECT
+            t.user AS target_user,
+            u.user AS other_user,
+            COUNT(u.user) AS overlap_count_with_target, 
+            COUNT(DISTINCT u.space_id) AS other_user_distinct_space_in_overlap_window, 
+            SUM(TIMESTAMPDIFF(SECOND, GREATEST(u.beginning, t.beginning), LEAST(u.end, t.end))) AS total_overlap_seconds 
+        FROM
+            all_user_sessions_with_space t
+        JOIN
+            user_location_trajectory_FINE_V2 u
+            ON t.user != u.user -- Ensure it's a different user
+            AND t.space_id = u.space_id
+            AND t.beginning < u.end
+            AND u.beginning < t.end
+        GROUP BY
+            t.user,
+            u.user
+    ),
+    qualified_copairs_new_conditions AS (
+        SELECT
+            os.target_user,
+            os.other_user
+        FROM
+            overlapping_sessions_and_stats_per_target_and_other os
+        JOIN
+            user_stats_all_users ts ON os.target_user = ts.user 
+        JOIN
+            user_stats_all_users ots ON os.other_user = ots.user
+        WHERE
+
+            (os.overlap_count_with_target * 1.0 / ts.total_count) >= 0.8
+            AND ts.total_count > 0
+            AND (ts.distinct_space > ots.distinct_space OR ts.total_count > ots.total_count)
+    )
+    SELECT
+        *
+    FROM
+        qualified_copairs_new_conditions;
+  index: target_user
+  columns: ["other_user"]
+
+# -- Connected to average <= 1 hour daily sessions on 80% of all days this device connected
+phone_1_hour_average_query: 
+  label: PHONE
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ), 
+    daily_avg_connection_time AS (
+        SELECT 
+            user, 
+            DATE(beginning) AS day,
+            SUM(TIMESTAMPDIFF(SECOND, beginning, end)) / COUNT(*) / 3600.0 AS avg_hours_per_connection
+        FROM total_sessions
+        GROUP BY user, DATE(beginning)
+    ),
+    matched_days AS (
+        SELECT user, day
+        FROM daily_avg_connection_time
+        WHERE avg_hours_per_connection <= 1
+    ),
+    user_day_counts AS (
+        SELECT 
+            d.user,
+            COUNT(DISTINCT d.day) AS total_days,
+            COUNT(DISTINCT m.day) AS qualifying_days
+        FROM daily_avg_connection_time d
+        LEFT JOIN matched_days m ON d.user = m.user AND d.day = m.day
+        GROUP BY d.user
+    ),
+    qualified_users AS (
+        SELECT user, total_days
+        FROM user_day_counts
+        WHERE qualifying_days * 1.0 / total_days >= 0.8
+            AND total_days >= 1
+    )
+    SELECT * 
+    FROM qualified_users;
+  index: user
+  columns: ["total_days"]
+
+# -- Seen in at least 6 distinct room types (conference room, office, meeting room, student lab, elevator, janitor, kitchen, rest room, telecom) and 30% in non work rooms
+phone_6_different_room_type_query: 
+  label: PHONE
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ), 
+    daily_avg_connection_time AS (
+        SELECT 
+            user, 
+            DATE(beginning) AS day,
+            SUM(TIMESTAMPDIFF(SECOND, beginning, end)) / COUNT(*) / 3600.0 AS avg_hours_per_connection
+        FROM total_sessions
+        GROUP BY user, DATE(beginning)
+    ),
+    matched_days AS (
+        SELECT user, day
+        FROM daily_avg_connection_time
+        WHERE avg_hours_per_connection <= 1
+    ),
+    user_day_counts AS (
+        SELECT 
+            d.user,
+            COUNT(DISTINCT d.day) AS total_days,
+            COUNT(DISTINCT m.day) AS qualifying_days
+        FROM daily_avg_connection_time d
+        LEFT JOIN matched_days m ON d.user = m.user AND d.day = m.day
+        GROUP BY d.user
+    ),
+    qualified_users AS (
+        SELECT user, total_days, qualifying_days
+        FROM user_day_counts
+        WHERE qualifying_days * 1.0 / total_days >= 0.8
+            AND total_days >= 1
+    )
+    SELECT * 
+    FROM qualified_users;
+  index: user
+  columns: ["total_days", "qualifying_days"]
+
+# -- Device is used for at least 3 days and on at least 80% of those days it connects to 6 or more rooms with at least 2 minutes per room 
+phone_3_days_6_room_type_query: 
+  label: PHONE
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ), 
+    total_days AS (
+        SELECT 
+            user, 
+            COUNT(DISTINCT DATE(beginning)) AS total_day_count
+        FROM total_sessions
+        GROUP BY user
+    ),
+    room_durations AS (
+        SELECT 
+            user,
+            DATE(beginning) AS day,
+            space_id,
+            SUM(TIMESTAMPDIFF(SECOND, beginning, end)) / 60.0 AS duration_minutes
+        FROM total_sessions
+        GROUP BY user, DATE(beginning), space_id
+    ),
+    rooms_over_2min AS (
+        SELECT 
+            user, 
+            day, 
+            space_id
+        FROM room_durations
+        WHERE duration_minutes >= 2
+    ),
+    days_with_6plus_rooms AS (
+        SELECT 
+            user, 
+            day
+        FROM rooms_over_2min
+        GROUP BY user, day
+        HAVING COUNT(DISTINCT space_id) >= 6
+    ),
+    qualified_day_counts AS (
+        SELECT 
+            user, 
+            COUNT(*) AS qualifying_day_count
+        FROM days_with_6plus_rooms
+        GROUP BY user
+    ),
+    user_ratios AS (
+        SELECT 
+            td.user,
+            td.total_day_count,
+            COALESCE(qd.qualifying_day_count, 0) AS qualifying_day_count,
+            COALESCE(qd.qualifying_day_count, 0) * 1.0 / td.total_day_count AS ratio
+        FROM total_days td
+        LEFT JOIN qualified_day_counts qd ON td.user = qd.user
+    ),
+    qualified_users AS (
+        SELECT user, total_day_count, ratio
+        FROM user_ratios
+        WHERE ratio >= 0.8 AND total_day_count >= 3
+    )
+    SELECT * 
+    FROM qualified_users;
+  index: user
+  columns: ["total_day_count", "ratio"]
+
+# -- 80% of total connections fall on weekdays (8 AM - 10 PM) 
+phone_weekday_query:
+  label: PHONE
+  query: |
+    WITH total_sessions AS (
+        SELECT * 
+        FROM user_location_trajectory_FINE_V2
+        WHERE user IN ({users_str})
+    ), 
+    total_connection_count AS (
+        SELECT 
+            user,
+            COUNT(*) AS total_count
+        FROM total_sessions
+        GROUP BY user
+    ),
+    valid_connections AS (
+        SELECT *
+        FROM total_sessions
+        WHERE 
+            DAYOFWEEK(DATE(beginning)) BETWEEN 2 AND 6 -- Monday (2) to Friday (6)
+            AND TIME(beginning) >= TIME '08:00:00'
+            AND TIME(end) <= TIME '22:00:00'
+    ),
+    valid_connection_count AS (
+        SELECT 
+            user,
+            COUNT(*) AS valid_count
+        FROM valid_connections
+        GROUP BY user
+    ),
+    user_valid_ratios AS (
+        SELECT 
+            tc.user,
+            tc.total_count,
+            COALESCE(vc.valid_count, 0) AS valid_count,
+            COALESCE(vc.valid_count, 0) * 1.0 / tc.total_count AS percentage
+        FROM total_connection_count tc
+        LEFT JOIN valid_connection_count vc ON tc.user = vc.user
+    ),
+    qualified_users AS (
+        SELECT user, percentage
+        FROM user_valid_ratios
+        WHERE percentage >= 0.8
+    )
+    SELECT *
+    FROM qualified_users;
+  index: user
+  columns: ["percentage"]

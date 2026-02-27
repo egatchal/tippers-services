@@ -1,0 +1,1172 @@
+# -- Users only connect to <= 3 unique rooms and whose first and last connections span less than 3 weeks 
+visitor_less_3_rooms_3_weeks_query:
+  label: VISITOR
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ),
+    unique_rooms as (
+        select user, count(distinct space_id) as count
+        from total_sessions
+        group by user
+    ), 
+    last_time as (
+        SELECT user, MAX(DATE(end)) as timeStamp
+        FROM total_sessions 
+        group by user
+    ),
+    start_time as (
+        SELECT user, MIN(DATE(beginning)) as timeStamp
+        FROM total_sessions 
+        group by user
+    ),
+    connected_difference as (
+        SELECT s.user, DATEDIFF(l.timeStamp, s.timeStamp) AS days_between
+        FROM start_time s
+        JOIN last_time l ON s.user = l.user
+        group by user
+    )
+    select *
+    from connected_difference c  
+    JOIN unique_rooms u ON c.user = u.user
+    where c.days_between <= 21 AND u.count <= 3; 
+  index: user
+  columns: ["days_between"]
+
+# -- Users have connected to less than or equal to 3 unique days between first and last connections 
+visitor_less_3_unique_days_query:
+  label: VISITOR
+  query: |
+    WITH payload_bounds AS (
+    SELECT 
+        payload,
+        MIN(DATE(timeStamp)) AS start_date,
+        MAX(DATE(timeStamp)) AS end_date
+    FROM observation_merged
+    WHERE payload IN ({users_str})
+    GROUP BY payload
+    ),
+    payload_day_counts AS (
+        SELECT 
+            o.payload,
+            COUNT(DISTINCT DATE(o.timeStamp)) AS connected_days
+        FROM observation_merged o
+        JOIN payload_bounds pb ON o.payload = pb.payload
+        WHERE DATE(o.timeStamp) BETWEEN pb.start_date AND pb.end_date
+        GROUP BY o.payload
+    )
+    SELECT * 
+    FROM payload_day_counts
+    WHERE connected_days <= 3;
+  index: payload
+  columns: ["connected_days"]
+
+# -- ≥ 80% of total connections are to COMMON rooms ("elevator", "rest room", "kitchen", "conference room", "meeting room" ) and ≤ 10% to RESIDENTIAL rooms ("office", "student lab")
+visitor_common_rooms_query: 
+  label: VISITOR
+  query: |
+    WITH total_sessions AS (
+    SELECT * 
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    ),
+    total_session_count AS (
+        SELECT user, COUNT(*) AS total_count
+        FROM total_sessions
+        GROUP BY user
+    ),
+    valid_room_sessions AS (
+        SELECT 
+            t.user,
+            t.space_id, 
+            t.beginning, 
+            t.end, 
+            sm.type AS type
+        FROM total_sessions t
+        JOIN space s ON t.space_id = s.space_id 
+        JOIN space_metadata sm ON sm.building_room = s.building_room
+        WHERE sm.type IN (
+            'conference room', 'office', 'meeting room', 
+            'student lab', 'elevator', 'janitor', 
+            'kitchen', 'rest room', 'telecom'
+        )
+    ),
+    room_type_counts AS (
+        SELECT 
+            v.user,
+            SUM(CASE WHEN v.type IN ('elevator', 'rest room', 'kitchen', 'conference room', 'meeting room') THEN 1 ELSE 0 END) * 1.0 
+                / t.total_count AS common_room_percentage,
+            SUM(CASE WHEN v.type IN ('office', 'student lab') THEN 1 ELSE 0 END) * 1.0 
+                / t.total_count AS residential_room_percentage
+        FROM valid_room_sessions v
+        JOIN total_session_count t ON v.user = t.user
+        GROUP BY v.user, t.total_count
+    )
+    SELECT * 
+    FROM room_type_counts
+    WHERE common_room_percentage >= 0.8
+      AND residential_room_percentage <= 0.1;
+  index: user
+  columns: ["common_room_percentage", "residential_room_percentage"]
+
+# -- >= 80 % of connections to Faculty Room (Works in MySQL)
+faculty_room_query: 
+  label: FACULTY
+  query: |
+    WITH total_count AS (
+    SELECT user, COUNT(*) AS total
+    FROM user_location_trajectory_FINE_V2
+    WHERE user IN ({users_str})
+    GROUP BY user
+    ),
+    space_count AS (
+        SELECT 
+            u.user, 
+            s.building_room, 
+            COUNT(*) AS count
+        FROM user_location_trajectory_FINE_V2 u
+        JOIN space s ON u.space_id = s.space_id
+        WHERE user IN ({users_str})
+        GROUP BY u.user, s.building_room
+    ),
+    qualified_rooms AS (
+        SELECT 
+            sc.user,
+            sc.count, 
+            tc.total
+        FROM space_count sc
+        JOIN total_count tc ON sc.user = tc.user
+        JOIN faculty_data f ON sc.building_room = f.office
+        WHERE sc.count * 1.0 / tc.total >= 0.8
+    )
+    SELECT *
+    FROM qualified_rooms;
+  index: user
+  columns: ["count", "total"]
+
+# -- Multiple hour duration (>= 2 hours) connections in faculty room types (conference room, meeting room, office) for >= 60% of time (Works in MySQL)
+faculty_multiple_hour_duration_query:
+    label: FACULTY
+    query: |
+        WITH total_sessions AS (
+        SELECT * 
+        FROM user_location_trajectory_FINE_V2
+        WHERE user IN ({users_str})
+        ),
+        total_duration AS (
+            SELECT user, SUM(TIMESTAMPDIFF(SECOND, beginning, end)) AS total_seconds
+            FROM total_sessions
+            GROUP BY user
+        ),
+        valid_room_sessions AS (
+            SELECT 
+                t.user,
+                t.space_id, 
+                t.beginning, 
+                t.end, 
+                sm.type AS type
+            FROM total_sessions t
+            JOIN space s ON t.space_id = s.space_id 
+            JOIN space_metadata sm ON sm.building_room = s.building_room
+            WHERE sm.type IN (
+                'conference room', 'office', 'meeting room', 
+                'student lab', 'elevator', 'janitor', 
+                'kitchen', 'rest room', 'telecom'
+            )
+        ),
+        faculty_room_sessions AS (
+            SELECT * 
+            FROM valid_room_sessions
+            WHERE type IN ('office', 'conference room', 'meeting room')
+        ),
+        long_faculty_sessions AS (
+            SELECT 
+                user,
+                SUM(TIMESTAMPDIFF(SECOND, beginning, end)) AS long_seconds
+            FROM faculty_room_sessions
+            WHERE TIMESTAMPDIFF(SECOND, beginning, end) >= 7200
+            GROUP BY user
+        ),
+        qualified_users AS (
+            SELECT 
+                td.user, td.total_seconds, lfs.long_seconds
+            FROM total_duration td
+            JOIN long_faculty_sessions lfs ON td.user = lfs.user
+            WHERE lfs.long_seconds * 1.0 / td.total_seconds >= 0.6
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["total_seconds", "long_seconds"]
+
+# -- On ≥ 80% of all connected days, the last connection of the day ends between 5:00 PM and 8:00 PM (Works)
+faculty_last_connection_query: 
+    label: FACULTY
+    query: |
+        WITH total_sessions AS (
+        SELECT * 
+        FROM user_location_trajectory_FINE_V2
+        WHERE user IN ({users_str})
+        ),
+        total_days AS (
+            SELECT 
+                user, 
+                COUNT(DISTINCT DATE(beginning)) AS distinct_day
+            FROM total_sessions
+            GROUP BY user
+        ),
+        end_days AS (
+            SELECT 
+                user, 
+                DATE(beginning) AS day, 
+                MAX(TIME(end)) AS last_connection_time
+            FROM total_sessions
+            GROUP BY user, DATE(beginning)
+            HAVING last_connection_time BETWEEN '17:00:00' AND '20:00:00'
+        ),
+        end_day_counts AS (
+            SELECT 
+                user, 
+                COUNT(*) AS end_day_count
+            FROM end_days
+            GROUP BY user
+        ),
+        qualified_users AS (
+            SELECT 
+                td.user,
+                distinct_day
+            FROM total_days td
+            JOIN end_day_counts ed ON td.user = ed.user
+            WHERE ed.end_day_count * 1.0 / td.distinct_day >= 0.8
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["distinct_day"]
+
+# -- On 40% of sessions, rooms where the user is present have ≥ 2 concurrent device connections (other user) (Works)
+# faculty_concurrent_users_query:
+#     label: FACULTY
+#     query: |
+#         WITH total_sessions AS (
+#             SELECT
+#                 u.user,
+#                 u.space_id,
+#                 s.number_of_connections
+#             FROM user_location_trajectory_FINE_V2 u
+#             INNER JOIN space_occupancy s
+#                 ON u.space_id = s.space_id
+#                 AND u.beginning < s.end
+#                 AND u.end > s.beginning
+#             WHERE u.user IN ({users_str})
+#         ),
+#         SELECT
+#             user,
+#             COUNT(*) AS total_count,
+#             SUM(CASE WHEN number_of_connections >= 2 THEN 1 ELSE 0 END) AS shared_count
+#         FROM total_sessions
+#         GROUP BY user
+#         HAVING shared_count * 1.0 / total_count >= 0.4
+#     index: user
+#     columns: ["total_count", "shared_count"]
+
+# -- On 80% of connected days, the user is connected to 3–5 unique rooms with ≥ 10 minutes per room, and at least 1 is a faculty office. (Works)
+faculty_unique_rooms_query: 
+    label: FACULTY
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connected_days AS (
+            SELECT 
+                user,
+                COUNT(DISTINCT DATE(beginning)) AS total_day_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        unique_rooms_per_day AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day, 
+                space_id, 
+                SUM(TIMESTAMPDIFF(MINUTE, beginning, end)) AS total_minutes
+            FROM total_sessions
+            GROUP BY user, DATE(beginning), space_id
+            HAVING total_minutes >= 10
+        ),
+        three_to_five_rooms AS (
+            SELECT 
+                user, 
+                day
+            FROM unique_rooms_per_day
+            GROUP BY user, day
+            HAVING COUNT(DISTINCT space_id) BETWEEN 3 AND 5
+        ),
+        faculty_office AS (
+            SELECT 
+                u.user, 
+                u.day
+            FROM unique_rooms_per_day u
+            JOIN space s ON u.space_id = s.space_id
+            JOIN faculty_data f ON s.building_room = f.office 
+            GROUP BY u.user, u.day
+        ),
+        both_conditions AS (
+            SELECT 
+                t.user, 
+                t.day
+            FROM three_to_five_rooms t
+            JOIN faculty_office f 
+                ON t.user = f.user AND t.day = f.day
+        ),
+        qualified_users AS (
+            SELECT 
+                td.user,
+                q.qualified_days, 
+                td.total_day_count
+            FROM total_connected_days td
+            JOIN (
+                SELECT user, COUNT(*) AS qualified_days
+                FROM both_conditions
+                GROUP BY user
+            ) q ON td.user = q.user
+            WHERE q.qualified_days * 1.0 / td.total_day_count >= 0.8
+        )
+        SELECT * 
+        FROM qualified_users;
+    index: user
+    columns: ["qualified_days", "total_day_count"]
+
+# -- ≥ 80% of total session time occurs in a staff-designated office room (works in MySQL)
+staff_office_query: 
+    label: STAFF
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connected_days AS (
+            SELECT 
+                user,
+                COUNT(DISTINCT DATE(beginning)) AS total_day_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        unique_rooms_per_day AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day, 
+                space_id, 
+                SUM(TIMESTAMPDIFF(MINUTE, beginning, end)) AS total_minutes
+            FROM total_sessions
+            GROUP BY user, DATE(beginning), space_id
+            HAVING total_minutes >= 10
+        ),
+        three_to_five_rooms AS (
+            SELECT 
+                user, 
+                day
+            FROM unique_rooms_per_day
+            GROUP BY user, day
+            HAVING COUNT(DISTINCT space_id) BETWEEN 3 AND 5
+        ),
+        faculty_office AS (
+            SELECT 
+                u.user, 
+                u.day
+            FROM unique_rooms_per_day u
+            JOIN space s ON u.space_id = s.space_id
+            JOIN faculty_data f ON s.building_room = f.office 
+            GROUP BY u.user, u.day
+        ),
+        both_conditions AS (
+            SELECT 
+                t.user, 
+                t.day
+            FROM three_to_five_rooms t
+            JOIN faculty_office f 
+                ON t.user = f.user AND t.day = f.day
+        ),
+        qualified_users AS (
+            SELECT 
+                td.user,
+                q.qualified_days, 
+                td.total_day_count
+            FROM total_connected_days td
+            JOIN (
+                SELECT user, COUNT(*) AS qualified_days
+                FROM both_conditions
+                GROUP BY user
+            ) q ON td.user = q.user
+            WHERE q.qualified_days * 1.0 / td.total_day_count >= 0.8
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["qualified_days", "total_day_count"]
+
+# -- 90% of session start and end times fall between 9 AM - 5 PM schedule (Works in MySQL)
+staff_schedule_query: 
+    label: STAFF
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_session_count AS (
+            SELECT 
+                user, 
+                COUNT(*) AS total_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        scheduled_sessions_count AS (
+            SELECT 
+                user, 
+                COUNT(*) AS scheduled_count
+            FROM total_sessions
+            WHERE 
+                TIME(beginning) BETWEEN '09:00:00' AND '17:00:00'
+                AND TIME(end) BETWEEN '09:00:00' AND '17:00:00'
+            GROUP BY user
+        ),
+        qualified_users AS (
+            SELECT 
+                t.user, 
+                s.scheduled_count, 
+                t.total_count
+            FROM total_session_count t
+            JOIN scheduled_sessions_count s ON t.user = s.user
+            WHERE s.scheduled_count * 1.0 / t.total_count >= 0.9
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["scheduled_count", "total_count"]
+
+# -- >= 2 hour connections (office and meeting rooms) occurs on at least 10 unique days (Works in MySQL)
+staff_2_hour_connections_query: 
+    label: STAFF
+    query: |
+        WITH total_sessions AS (
+            SELECT 
+                u.user,
+                u.space_id, 
+                u.beginning, 
+                u.end
+            FROM user_location_trajectory_FINE_V2 u 
+            JOIN space s ON u.space_id = s.space_id 
+            JOIN space_metadata sm ON s.building_room = sm.building_room
+            WHERE sm.type IN ('office', 'meeting') AND user IN ({users_str})
+        ),
+        two_hour_connections AS (
+            SELECT 
+                user, 
+                DATE(beginning) AS day
+            FROM total_sessions
+            WHERE TIMESTAMPDIFF(HOUR, beginning, end) >= 2
+        ),
+        user_day_counts AS (
+            SELECT 
+                user, 
+                COUNT(DISTINCT day) AS long_session_days
+            FROM two_hour_connections
+            GROUP BY user
+        ),
+        qualified_users AS (
+            SELECT user, long_session_days
+            FROM user_day_counts
+            WHERE long_session_days >= 10
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["long_session_days"]
+
+# -- >= 80% of all connected days to 1-2 unique rooms with more than 10 minutes of connection to each and 1 has to be office type (Works in MySQL)
+staff_unique_rooms_query: 
+    label: STAFF
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connected_days AS (
+            SELECT 
+                user, 
+                COUNT(DISTINCT DATE(beginning)) AS total_day_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        unique_rooms_per_day AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day, 
+                space_id, 
+                SUM(TIMESTAMPDIFF(MINUTE, beginning, end)) AS total_minutes
+            FROM total_sessions
+            GROUP BY user, DATE(beginning), space_id
+            HAVING total_minutes >= 10
+        ),
+        less_than_rooms AS (
+            SELECT 
+                user, 
+                day
+            FROM unique_rooms_per_day
+            GROUP BY user, day
+            HAVING COUNT(DISTINCT space_id) <= 2
+        ),
+        faculty_room AS (
+            SELECT DISTINCT office 
+            FROM faculty_data
+        ),
+        staff_office AS (
+            SELECT 
+                u.user, 
+                u.day
+            FROM unique_rooms_per_day u
+            JOIN space s ON u.space_id = s.space_id
+            JOIN space_metadata smd ON s.building_room = smd.building_room
+            LEFT JOIN faculty_room fr ON s.building_room = fr.office 
+            WHERE smd.type = 'office' AND fr.office IS NULL
+            GROUP BY u.user, u.day
+            HAVING COUNT(*) >= 1
+        ),
+        both_conditions AS (
+            SELECT 
+                l.user, 
+                l.day
+            FROM less_than_rooms l
+            JOIN staff_office s 
+                ON l.user = s.user AND l.day = s.day
+        ),
+        qualified_users AS (
+            SELECT 
+                tcd.user, 
+                q.qualified_days, 
+                tcd.total_day_count
+            FROM total_connected_days tcd
+            JOIN (
+                SELECT 
+                    user, 
+                    COUNT(DISTINCT day) AS qualified_days
+                FROM both_conditions
+                GROUP BY user
+            ) q ON tcd.user = q.user
+            WHERE q.qualified_days * 1.0 / tcd.total_day_count >= 0.8
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["qualified_days", "total_day_count"]
+
+#-- It is active on more than 3 days and it connects in ≥ 5 distinct 2-hour bins (based on daily start and end times) (Works)
+undergrad_start_end_time_query: 
+    label: UNDERGRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_days AS (
+            SELECT 
+                user, 
+                COUNT(DISTINCT DATE(beginning)) AS day_count
+            FROM total_sessions
+            GROUP BY user
+        ), 
+        daily_times AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day, 
+                FLOOR(HOUR(MIN(beginning)) / 2) AS early_beginning, 
+                FLOOR(HOUR(MAX(end)) / 2) AS latest_end
+            FROM total_sessions
+            GROUP BY user, DATE(beginning)
+        ),
+        distinct_time_bins AS (
+            SELECT 
+                user, 
+                COUNT(DISTINCT CONCAT(early_beginning, '-', latest_end)) AS bin_pair_count
+            FROM daily_times
+            GROUP BY user
+        ),
+        qualified_users AS (
+            SELECT 
+                td.user, 
+                td.day_count, 
+                db.bin_pair_count
+            FROM total_days td
+            JOIN distinct_time_bins db ON td.user = db.user
+            WHERE td.day_count > 3 AND db.bin_pair_count >= 5
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["day_count", "bin_pair_count"]
+
+# -- On ≥ 80% of its connected days, the average session duration while connected to student lab is between 30 minutes and 1.5 hours (Works)
+undergrad_avg_session_duration_query: 
+    label: UNDERGRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2 u 
+            WHERE user IN ({users_str})
+        ),
+        total_days AS (
+            SELECT user, COUNT(DISTINCT DATE(beginning)) AS day_count
+            FROM total_sessions
+            GROUP BY user
+        ), 
+        matched_days AS (
+            SELECT 
+                t.user, 
+                DATE(t.beginning) AS day, 
+                SUM(TIMESTAMPDIFF(SECOND, t.beginning, t.end)) / COUNT(*) AS average
+            FROM total_sessions t 
+            JOIN space s ON t.space_id = s.space_id
+            JOIN space_metadata smd ON s.building_room = smd.building_room 
+            WHERE smd.type = 'student lab'
+            GROUP BY t.user, DATE(t.beginning)
+        ),
+        matched_percentage AS (
+            SELECT 
+                m.user,
+                COUNT(*) * 1.0 / td.day_count AS percentage
+            FROM matched_days m
+            JOIN total_days td ON m.user = td.user
+            WHERE (average / 3600) BETWEEN 0.5 AND 1.5 
+            GROUP BY m.user, td.day_count
+        )
+        SELECT *
+        FROM matched_percentage
+        WHERE percentage >= 0.8;
+    index: user
+    columns: ["percentage"]
+
+# -- Connected to 6+ distinct rooms on daily average where no room accounts for more than 50% of connections (Works)
+undergrad_distinct_rooms_query:
+    label: UNDERGRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        daily_connections AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day,
+                COUNT(*) AS total_connections
+            FROM total_sessions
+            GROUP BY user, DATE(beginning)
+        ),
+        room_connections_per_day AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day,
+                space_id,
+                COUNT(*) AS room_connections
+            FROM total_sessions
+            GROUP BY user, DATE(beginning), space_id
+        ),
+        room_dominance AS (
+            SELECT 
+                r.user,
+                r.day,
+                r.space_id,
+                r.room_connections,
+                d.total_connections,
+                r.room_connections * 1.0 / d.total_connections AS connection_ratio
+            FROM room_connections_per_day r
+            JOIN daily_connections d 
+            ON r.user = d.user AND r.day = d.day
+        ),
+        daily_stats AS (
+            SELECT 
+                user,
+                day,
+                COUNT(DISTINCT space_id) AS distinct_rooms,
+                MAX(connection_ratio) AS max_connection_ratio
+            FROM room_dominance
+            GROUP BY user, day
+        ),
+        final_stats AS (
+            SELECT 
+                user,
+                AVG(distinct_rooms) AS avg_daily_rooms,
+                COUNT(*) AS total_days,
+                SUM(CASE WHEN max_connection_ratio <= 0.5 THEN 1 ELSE 0 END) AS compliant_days
+            FROM daily_stats
+            GROUP BY user
+        ),
+        qualified_users AS (
+            SELECT user, avg_daily_rooms, compliant_days
+            FROM final_stats
+            WHERE avg_daily_rooms >= 6 
+            AND compliant_days = total_days
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["avg_daily_rooms", "compliant_days"]
+
+# -- Connections end time >= 8:30 PM on at least 10 days (Works)
+undergrad_end_time_10_days_query: 
+    label: UNDERGRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day, 
+                MAX(end) AS latest_end
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str}) 
+            GROUP BY user, DATE(beginning)
+        ),
+        late_days AS (
+            SELECT 
+                user, 
+                day
+            FROM total_sessions
+            WHERE TIME(latest_end) >= '20:30:00'
+        ),
+        qualified_users AS (
+            SELECT user
+            FROM late_days
+            GROUP BY user
+            HAVING COUNT(*) >= 10
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: []
+
+# -- 90% of total rooms connected has more than 1 occupancy (Works)
+undergrad_room_occupancy_query: 
+    label: UNDERGRAD
+    query: |
+        WITH user_session_and_occupancy AS (
+            SELECT
+                u.user,
+                -- A flag to identify sessions that meet the 'qualified' criteria after joining
+                CASE
+                    WHEN s.space_id IS NOT NULL AND s.number_of_connections >= 1 THEN 1
+                    ELSE 0
+                END AS is_qualified_session_flag
+            FROM user_location_trajectory_FINE_V2 u
+            LEFT JOIN space_occupancy s
+                -- Join conditions for space_id and time overlap
+                ON u.space_id = s.space_id
+                AND (u.beginning <= s.end AND s.beginning <= u.end)
+            WHERE u.user IN ({users_str}) -- Essential filter pushdown
+        ),
+        user_aggregated_stats AS (
+            SELECT
+                user,
+                -- total_count: Counts all original sessions from user_location_trajectory_FINE_V2 for the given users.
+                -- LEFT JOIN ensures all 'u' rows are kept, so COUNT(*) here gives the total.
+                COUNT(*) AS total_count,
+                -- qualified_count: Sums the flag where the session met the qualified criteria.
+                SUM(is_qualified_session_flag) AS qualified_count
+            FROM user_session_and_occupancy
+            GROUP BY user
+        )
+        SELECT
+            user
+        FROM user_aggregated_stats
+        WHERE qualified_count * 1.0 / total_count >= 0.9;
+    index: user
+    columns: []
+
+# -- Out of all connected days, no day of week with more than 40% of connections (Works)
+undergrad_split_work_days_query: 
+    label: UNDERGRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str}) 
+        ),
+        total_session_count AS (
+            SELECT 
+                user, 
+                COUNT(*) AS total_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        day_of_week_connections AS (
+            SELECT 
+                user, 
+                DAYOFWEEK(DATE(beginning)) AS day, 
+                COUNT(*) AS number_of_connections
+            FROM total_sessions 
+            GROUP BY user, DAYOFWEEK(DATE(beginning))
+        ),
+        day_of_week_percentage AS (
+            SELECT 
+                d.user,
+                d.day,
+                d.number_of_connections * 1.0 / t.total_count AS percentage
+            FROM day_of_week_connections d
+            JOIN total_session_count t ON d.user = t.user
+        ),
+        users_meeting_rule AS (
+            SELECT user
+            FROM day_of_week_percentage
+            GROUP BY user
+            HAVING MAX(percentage) <= 0.4
+        )
+        SELECT *
+        FROM users_meeting_rule;
+    index: user
+    columns: []
+
+# -- >= 70% or more of all connections to Student Lab on Weekdays (Works)
+grad_student_lab_query: 
+    label: GRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str}) 
+        ),
+        weekdays AS (
+            SELECT *
+            FROM total_sessions
+            WHERE DAYOFWEEK(DATE(beginning)) BETWEEN 2 AND 6 -- Monday to Friday
+        ),
+        weekday_count AS (
+            SELECT 
+                user,
+                COUNT(*) AS total_weekday_sessions
+            FROM weekdays
+            GROUP BY user
+        ),
+        student_lab_sessions AS (
+            SELECT 
+                w.user,
+                COUNT(*) AS student_lab_session_count
+            FROM weekdays w
+            JOIN space s ON w.space_id = s.space_id
+            JOIN space_metadata sm ON s.building_room = sm.building_room
+            WHERE sm.type = 'student lab'
+            GROUP BY w.user
+        ),
+        student_lab_percentage AS (
+            SELECT 
+                u.user,
+                COALESCE(s.student_lab_session_count, 0) * 1.0 / u.total_weekday_sessions AS percentage
+            FROM weekday_count u
+            LEFT JOIN student_lab_sessions s ON u.user = s.user
+        ),
+        qualified_users AS (
+            SELECT user, percentage
+            FROM student_lab_percentage
+            WHERE percentage >= 0.7
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["percentage"]
+
+# -- >= 80% of all connections to 3-5 rooms with more than 10 minutes at each must include office and student lab (Works)
+grad_room_connection_query: 
+    label: GRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str}) 
+        ),
+        total_connected_days AS (
+            SELECT 
+                user,
+                COUNT(DISTINCT DATE(beginning)) AS total_day_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        unique_rooms_per_day AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day,
+                space_id,
+                SUM(TIMESTAMPDIFF(MINUTE, beginning, end)) AS total_minutes
+            FROM total_sessions
+            GROUP BY user, DATE(beginning), space_id
+            HAVING total_minutes >= 10
+        ),
+        matched_number_rooms AS (
+            SELECT 
+                user,
+                day
+            FROM unique_rooms_per_day
+            GROUP BY user, day
+            HAVING COUNT(DISTINCT space_id) BETWEEN 3 AND 5
+        ),
+        days_connected_to_room_type AS (
+            SELECT 
+                u.user,
+                u.day,
+                COUNT(DISTINCT sm.type) AS distinct_room_type
+            FROM unique_rooms_per_day u
+            JOIN space s ON u.space_id = s.space_id 
+            JOIN space_metadata sm ON s.building_room = sm.building_room
+            WHERE sm.type IN ('office', 'student lab')
+            GROUP BY u.user, u.day
+        ),
+        days_connected_to_both_types AS (
+            SELECT 
+                user,
+                day
+            FROM days_connected_to_room_type
+            WHERE distinct_room_type >= 2
+        ),
+        both_conditions_days AS (
+            SELECT 
+                m.user,
+                m.day
+            FROM matched_number_rooms m
+            JOIN days_connected_to_both_types d 
+            ON m.user = d.user AND m.day = d.day
+        ),
+        both_conditions_count AS (
+            SELECT 
+                b.user,
+                COUNT(*) * 1.0 / t.total_day_count AS percentage
+            FROM both_conditions_days b
+            JOIN total_connected_days t ON b.user = t.user
+            GROUP BY b.user, t.total_day_count
+        ),
+        qualified_users AS (
+            SELECT user, percentage
+            FROM both_conditions_count
+            WHERE percentage >= 0.8
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["percentage"]
+
+# -- >= 50% of all days connected, must have >= 1 connection to student lab with at least 10 minutes (Works)
+grad_mandatory_student_lab_1_connection_query: 
+    label: GRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connected_days AS (
+            SELECT 
+                user,
+                COUNT(DISTINCT DATE(beginning)) AS total_day_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        unique_rooms_per_day AS (
+            SELECT 
+                user,
+                DATE(beginning) AS day,
+                space_id,
+                SUM(TIMESTAMPDIFF(MINUTE, beginning, end)) AS total_minutes
+            FROM total_sessions
+            GROUP BY user, DATE(beginning), space_id
+            HAVING total_minutes >= 10
+        ),
+        days_connected_to_student_lab AS (
+            SELECT 
+                u.user,
+                u.day
+            FROM unique_rooms_per_day u
+            JOIN space s ON u.space_id = s.space_id
+            JOIN space_metadata sm ON s.building_room = sm.building_room
+            WHERE sm.type = 'student lab'
+            GROUP BY u.user, u.day
+        ),
+        student_lab_day_percentage AS (
+            SELECT 
+                d.user,
+                COUNT(*) * 1.0 / t.total_day_count AS percentage
+            FROM days_connected_to_student_lab d
+            JOIN total_connected_days t ON d.user = t.user
+            GROUP BY d.user, t.total_day_count
+        ),
+        qualified_users AS (
+            SELECT user, percentage
+            FROM student_lab_day_percentage
+            WHERE percentage >= 0.5
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["percentage"]
+
+# -- At least 10% of all user connections are to faculty offices (with ≥10 minutes stay), and these occur on at least 10 distinct days (Works)
+grad_faculty_office_query: 
+    label: GRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connection_count AS (
+            SELECT 
+                user,
+                COUNT(*) AS total_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        faculty_office_sessions AS (
+            SELECT 
+                t.user,
+                t.space_id,
+                t.beginning,
+                t.end
+            FROM total_sessions t 
+            JOIN space s ON t.space_id = s.space_id 
+            JOIN faculty_data f ON s.building_room = f.office
+            WHERE TIMESTAMPDIFF(MINUTE, t.beginning, t.end) >= 10
+        ),
+        faculty_office_distinct_days AS (
+            SELECT 
+                user,
+                COUNT(DISTINCT DATE(beginning)) AS count_days
+            FROM faculty_office_sessions
+            GROUP BY user
+        ),
+        faculty_office_connection_percentage AS (
+            SELECT 
+                f.user,
+                COUNT(*) * 1.0 / t.total_count AS percentage
+            FROM faculty_office_sessions f
+            JOIN total_connection_count t ON f.user = t.user
+            GROUP BY f.user, t.total_count
+        ),
+        qualified_users AS (
+            SELECT f.user, f.percentage, fd.count_days
+            FROM faculty_office_connection_percentage f
+            JOIN faculty_office_distinct_days fd ON f.user = fd.user
+            WHERE f.percentage >= 0.1 AND fd.count_days >= 10
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["percentage", "count_days"]
+
+# -- At least 10% connections to meeting rooms and conference rooms (Works)
+grad_meeting_conference_room_query: 
+    label: GRAD
+    query: |
+        WITH total_sessions AS (
+            SELECT * 
+            FROM user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connection_count AS (
+            SELECT 
+                user,
+                COUNT(*) AS total_count
+            FROM total_sessions
+            GROUP BY user
+        ),
+        matched_sessions AS (
+            SELECT 
+                t.user,
+                COUNT(*) AS matched_count
+            FROM total_sessions t
+            JOIN space s ON t.space_id = s.space_id 
+            JOIN space_metadata sm ON s.building_room = sm.building_room
+            WHERE sm.type IN ('meeting room', 'conference room')
+            GROUP BY t.user
+        ),
+        matched_percentage AS (
+            SELECT 
+                m.user,
+                m.matched_count * 1.0 / t.total_count AS percentage
+            FROM matched_sessions m
+            JOIN total_connection_count t ON m.user = t.user
+        ),
+        qualified_users AS (
+            SELECT user, percentage
+            FROM matched_percentage
+            WHERE percentage >= 0.1
+        )
+        SELECT *
+        FROM qualified_users;
+    index: user
+    columns: ["percentage"]
+
+# -- >= 80% of days have last connected time between 5:30 PM - 7:30 PM (Works)
+grad_last_connected_time_query:
+    label: GRAD
+    query: |
+        WITH user_session_data AS (
+            SELECT
+                user,
+                CAST(beginning AS DATE) AS session_date,
+                CAST(end AS TIME) AS session_end_time
+            FROM
+                user_location_trajectory_FINE_V2
+            WHERE user IN ({users_str})
+        ),
+        total_connected_days_per_user AS (
+            SELECT
+                user,
+                COUNT(DISTINCT session_date) AS total_day_count
+            FROM
+                user_session_data
+            GROUP BY
+                user
+        ),
+        matched_sessions_per_user AS (
+            SELECT
+                user,
+                session_date
+            FROM
+                user_session_data
+            WHERE
+                session_end_time BETWEEN '17:30:00' AND '19:30:00'
+            GROUP BY
+                user,
+                session_date
+        ),
+        matched_session_count_per_user AS (
+            SELECT
+                user,
+                COUNT(*) AS matched_count
+            FROM
+                matched_sessions_per_user
+            GROUP BY
+                user
+        ),
+        user_percentage AS (
+            SELECT
+                tcd.user,
+                CAST(COALESCE(msc.matched_count, 0) AS REAL) * 1.0 / tcd.total_day_count AS percentage
+            FROM
+                total_connected_days_per_user tcd
+            LEFT JOIN
+                matched_session_count_per_user msc
+            ON
+                tcd.user = msc.user
+            WHERE tcd.total_day_count > 0 -- Avoid division by zero for users with no connected days
+        )
+        SELECT
+            *
+        FROM
+            user_percentage
+        WHERE
+            percentage >= 0.8;
+    index: user
+    columns: ["percentage"]

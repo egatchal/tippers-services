@@ -2,9 +2,9 @@ import client from '../../../shared/api/client';
 import type { SnorkelJob, SnorkelResults } from '../types/entities';
 
 export async function runSnorkel(cId: number, body: {
-  selectedIndex: number;
+  selectedIndex?: number;
   selectedRules?: number[];
-  selectedLFs: number[];
+  selectedLFs?: number[];
   snorkel: { epochs?: number; lr?: number; sample_size?: number; output_type?: string };
 }): Promise<SnorkelJob> {
   const { data } = await client.post(`/concepts/${cId}/snorkel/run`, body);
@@ -26,8 +26,24 @@ export async function getSnorkelResults(cId: number, jobId: number): Promise<Sno
   return data;
 }
 
+export async function updateSnorkelJob(cId: number, jobId: number, body: {
+  lf_ids?: number[];
+  index_id?: number;
+}): Promise<SnorkelJob> {
+  const { data } = await client.patch(`/concepts/${cId}/snorkel/jobs/${jobId}`, body);
+  return data;
+}
+
 export async function deleteSnorkelJob(cId: number, jobId: number): Promise<void> {
   await client.delete(`/concepts/${cId}/snorkel/jobs/${jobId}`);
+}
+
+export async function executeSnorkelJob(cId: number, jobId: number, configOverride?: {
+  epochs?: number;
+  lr?: number;
+}): Promise<SnorkelJob> {
+  const { data } = await client.post(`/concepts/${cId}/snorkel/jobs/${jobId}/execute`, configOverride ?? {});
+  return data;
 }
 
 export async function cancelSnorkelJob(cId: number, jobId: number): Promise<SnorkelJob> {

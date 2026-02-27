@@ -12,6 +12,7 @@ from backend.dagster_app.jobs import (
     snorkel_training_pipeline,
     classifier_training_pipeline,
     occupancy_incremental_job,
+    snorkel_pipeline_job,
 )
 
 # Load all assets (graph-based ops/graphs are not @assets so are excluded)
@@ -27,6 +28,7 @@ defs = Definitions(
         snorkel_training_pipeline,
         classifier_training_pipeline,
         occupancy_incremental_job,
+        snorkel_pipeline_job,
     ],
     sensors=[
         occupancy_dataset_failure_sensor,

@@ -13,7 +13,19 @@ export interface ConceptValue {
   description?: string;
   display_order?: number;
   level: number;
+  parent_cv_id?: number;
   created_at: string;
+}
+
+export interface ConceptValueTreeNode extends ConceptValue {
+  children: ConceptValueTreeNode[];
+}
+
+export interface EntityPreviewResponse {
+  index_id: number;
+  source_type: string;
+  total_count: number;
+  entities: Record<string, unknown>[];
 }
 
 export interface ColumnStat {
@@ -33,6 +45,7 @@ export interface Index {
   c_id: number;
   conn_id: number;
   name: string;
+  key_column?: string;
   sql_query: string;
   query_template_params?: Record<string, unknown>;
   partition_type?: string;
@@ -42,6 +55,13 @@ export interface Index {
   materialized_at?: string;
   row_count?: number;
   column_stats?: Record<string, ColumnStat>;
+  source_type?: string;
+  cv_id?: number;
+  parent_index_id?: number;
+  parent_snorkel_job_id?: number;
+  label_filter?: Record<string, unknown>;
+  filtered_count?: number;
+  output_type?: string;
   created_at: string;
   updated_at: string;
 }
@@ -52,7 +72,6 @@ export interface Rule {
   index_id: number;
   name: string;
   sql_query: string;
-  index_column?: string;
   query_template_params?: Record<string, unknown>;
   partition_type?: string;
   partition_config?: Record<string, unknown>;
@@ -65,27 +84,6 @@ export interface Rule {
   updated_at: string;
 }
 
-export interface Feature {
-  feature_id: number;
-  c_id: number;
-  index_id: number;
-  name: string;
-  description?: string;
-  sql_query: string;
-  index_column?: string;
-  columns?: string[];
-  query_template_params?: Record<string, unknown>;
-  level?: number;
-  partition_type?: string;
-  partition_config?: Record<string, unknown>;
-  storage_path?: string;
-  is_materialized: boolean;
-  materialized_at?: string;
-  row_count?: number;
-  column_stats?: Record<string, ColumnStat>;
-  created_at: string;
-  updated_at: string;
-}
 
 export interface LabelingFunction {
   lf_id: number;
@@ -111,7 +109,7 @@ export interface LabelingFunction {
 export interface SnorkelJob {
   job_id: number;
   c_id: number;
-  index_id: number;
+  index_id: number | null;
   rule_ids: number[];
   lf_ids: number[];
   config: { epochs?: number; lr?: number; sample_size?: number };
@@ -124,19 +122,6 @@ export interface SnorkelJob {
   completed_at?: string;
 }
 
-export interface ClassifierJob {
-  job_id: number;
-  c_id: number;
-  snorkel_job_id: number;
-  feature_ids: number[];
-  config: Record<string, unknown>;
-  dagster_run_id?: string;
-  status: string;
-  result_path?: string;
-  error_message?: string;
-  created_at: string;
-  completed_at?: string;
-}
 
 export interface SnorkelResults {
   job_id: number;
@@ -151,11 +136,3 @@ export interface SnorkelResults {
   predictions?: { probabilities: number[][]; labels: number[]; sample_ids: unknown[] };
 }
 
-export interface ClassifierResults {
-  job_id: number;
-  status: string;
-  filtering_stats: Record<string, unknown>;
-  model_scores: Array<Record<string, unknown>>;
-  num_models_trained: number;
-  config_used: Record<string, unknown>;
-}

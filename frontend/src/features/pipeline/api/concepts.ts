@@ -1,5 +1,5 @@
 import client from '../../../shared/api/client';
-import type { Concept, ConceptValue } from '../types/entities';
+import type { Concept, ConceptValue, ConceptValueTreeNode } from '../types/entities';
 
 export async function listConcepts(): Promise<Concept[]> {
   const { data } = await client.get('/concepts/');
@@ -30,16 +30,21 @@ export async function listConceptValues(cId: number): Promise<ConceptValue[]> {
   return data;
 }
 
-export async function createConceptValue(cId: number, body: { name: string; description?: string; display_order?: number; level?: number }): Promise<ConceptValue> {
+export async function createConceptValue(cId: number, body: { name: string; description?: string; display_order?: number; level?: number; parent_cv_id?: number }): Promise<ConceptValue> {
   const { data } = await client.post(`/concepts/${cId}/values`, body);
   return data;
 }
 
-export async function updateConceptValue(cId: number, cvId: number, body: { name?: string; description?: string; display_order?: number; level?: number }): Promise<ConceptValue> {
+export async function updateConceptValue(cId: number, cvId: number, body: { name?: string; description?: string; display_order?: number; level?: number; parent_cv_id?: number | null }): Promise<ConceptValue> {
   const { data } = await client.patch(`/concepts/${cId}/values/${cvId}`, body);
   return data;
 }
 
 export async function deleteConceptValue(cId: number, cvId: number): Promise<void> {
   await client.delete(`/concepts/${cId}/values/${cvId}`);
+}
+
+export async function getConceptValueTree(cId: number): Promise<ConceptValueTreeNode[]> {
+  const { data } = await client.get(`/concepts/${cId}/values/tree`);
+  return data;
 }

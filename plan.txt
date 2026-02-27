@@ -1,0 +1,222 @@
+│ Translate MySQL Query YAMLs to PostgreSQL Pipeline Input .md Files                                             │
+│                                                                                                                │
+│ Context                                                                                                        │
+│                                                                                                                │
+│ Three YAML files (device_queries.yaml, user_queries.yaml, group_queries.yaml) contain MySQL-syntax queries for │
+│  WiFi device/user classification. These need to be translated into PostgreSQL and formatted as pipeline input  │
+│ .md files (following the pattern in pipeline_inputs.md). All queries target user_ap_trajectory(mac_address,    │
+│ sensor_id, start_time, end_time, space_id). Join tables (space, space_metadata, faculty_data,                  │
+│ region_to_coverage, space_occupancy) all exist in PG.                                                          │
+│                                                                                                                │
+│ Additionally: document the pass-through derived index pattern for "people" CV — a derived index with           │
+│ label_filter=null that gets ALL entities from human_owned_devices without Snorkel filtering.                   │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ Files to Create                                                                                                │
+│                                                                                                                │
+│ ┌──────────────────────┬─────────┬──────────────────────────────────────────────────────────────┐              │
+│ │         File         │ Queries │                            Labels                            │              │
+│ ├──────────────────────┼─────────┼──────────────────────────────────────────────────────────────┤              │
+│ │ device_queries_pg.md │ 16      │ STATIC (6), LAPTOP (5), PHONE (5)                            │              │
+│ ├──────────────────────┼─────────┼──────────────────────────────────────────────────────────────┤              │
+│ │ user_queries_pg.md   │ 23      │ VISITOR (3), FACULTY (4), STAFF (4), UNDERGRAD (6), GRAD (6) │              │
+│ ├──────────────────────┼─────────┼──────────────────────────────────────────────────────────────┤              │
+│ │ group_queries_pg.md  │ 3       │ Open-ended (space_name discovery, not fixed CVs)             │              │
+│ └──────────────────────┴─────────┴──────────────────────────────────────────────────────────────┘              │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ Translation Rules                                                                                              │
+│                                                                                                                │
+│ Column Mapping                                                                                                 │
+│                                                                                                                │
+│ ┌──────────────────────────────────┬────────────────────┐                                                      │
+│ │              MySQL               │     PostgreSQL     │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ user                             │ mac_address        │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ access_point                     │ sensor_id          │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ beginning                        │ start_time         │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ end                              │ end_time           │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ payload (observation_merged)     │ mac_address        │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ timeStamp (observation_merged)   │ start_time         │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ user_location_trajectory_FINE_V2 │ user_ap_trajectory │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ observation_merged               │ user_ap_trajectory │                                                      │
+│ ├──────────────────────────────────┼────────────────────┤                                                      │
+│ │ {users_str}                      │ :index_values      │                                                      │
+│ └──────────────────────────────────┴────────────────────┘                                                      │
+│                                                                                                                │
+│ Syntax Mapping                                                                                                 │
+│                                                                                                                │
+│ ┌─────────────────────────────┬───────────────────────────────────────────────────────┐                        │
+│ │            MySQL            │                      PostgreSQL                       │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ TIMESTAMPDIFF(SECOND, a, b) │ EXTRACT(EPOCH FROM (b - a))                           │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ TIMESTAMPDIFF(MINUTE, a, b) │ EXTRACT(EPOCH FROM (b - a)) / 60.0                    │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ TIMESTAMPDIFF(HOUR, a, b)   │ EXTRACT(EPOCH FROM (b - a)) / 3600.0                  │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ DATE(x)                     │ x::date                                               │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ TIME(x)                     │ x::time                                               │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ DAYOFWEEK(x) (1=Sun MySQL)  │ EXTRACT(DOW FROM x) (0=Sun PG)                        │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ HOUR(x)                     │ EXTRACT(HOUR FROM x)                                  │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ DATEDIFF(a, b)              │ (a::date - b::date)                                   │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ CONCAT(a, '-', b)           │ a::text || '-' || b::text                             │                        │
+│ ├─────────────────────────────┼───────────────────────────────────────────────────────┤                        │
+│ │ HAVING alias >= x           │ Wrap in subquery (PG doesn't allow aliases in HAVING) │                        │
+│ └─────────────────────────────┴───────────────────────────────────────────────────────┘                        │
+│                                                                                                                │
+│ DAYOFWEEK Shift (Critical)                                                                                     │
+│                                                                                                                │
+│ MySQL weekday ranges must be adjusted:                                                                         │
+│ - MySQL BETWEEN 2 AND 6 (Mon-Fri) → PG BETWEEN 1 AND 5                                                         │
+│ - MySQL BETWEEN 1 AND 5 → check intent per query                                                               │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ Structure of Each .md                                                                                          │
+│                                                                                                                │
+│ Follow pipeline_inputs.md format:                                                                              │
+│                                                                                                                │
+│ # [Title] Pipeline Inputs (PostgreSQL)                                                                         │
+│ ## Concept Hierarchy (CV tree)                                                                                 │
+│ ## 1. Index (SQL) — SELECT DISTINCT mac_address FROM user_ap_trajectory                                        │
+│ ## 2. Rules — one per query, returns metrics WITHOUT final WHERE filter                                        │
+│ ## 3. Labeling Functions — one per rule, implements threshold from original WHERE                              │
+│ ## 4. Snorkel Run — config (index, LFs, cardinality)                                                           │
+│ ## 5. Derived Indexes — filter config per CV                                                                   │
+│                                                                                                                │
+│ Rule Pattern                                                                                                   │
+│                                                                                                                │
+│ Original query's final WHERE filter is REMOVED from the rule SQL. Metrics are returned for ALL entities.       │
+│ Example:                                                                                                       │
+│                                                                                                                │
+│ Original MySQL (filters):                                                                                      │
+│ SELECT * FROM agg_data WHERE avg_hours >= 15 AND distinct_ap = 1;                                              │
+│ Rule SQL (metrics only):                                                                                       │
+│ SELECT mac_address, avg_hours, distinct_date, distinct_ap FROM agg_data                                        │
+│ LF (applies filter):                                                                                           │
+│ def labeling_function(row):                                                                                    │
+│     if row['avg_hours'] >= 15 and row['distinct_date'] >= 10 and row['distinct_ap'] == 1:                      │
+│         return STATIC                                                                                          │
+│     return ABSTAIN                                                                                             │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ File 1: device_queries_pg.md                                                                                   │
+│                                                                                                                │
+│ CV Tree                                                                                                        │
+│                                                                                                                │
+│ device_type                                                                                                    │
+│   ├── STATIC                                                                                                   │
+│   └── human_owned_device                                                                                       │
+│       ├── LAPTOP                                                                                               │
+│       ├── PHONE (cellphone)                                                                                    │
+│       └── PEOPLE (pass-through, label_filter=null)                                                             │
+│                                                                                                                │
+│ Pipeline Design                                                                                                │
+│                                                                                                                │
+│ - Level 1 Snorkel: All 16 LFs, applicable labels = STATIC, LAPTOP, PHONE (cardinality=3)                       │
+│ - Derived indexes: STATIC/LAPTOP/PHONE use softmax or argmax filtering                                         │
+│ - PEOPLE: Derived index with label_filter=null → passes through ALL human_owned entities                       │
+│   - Works because resolve_entities.py:137-140 returns df_root when label_filter is empty                       │
+│   - Snorkel won't model "people" since no LF has it in applicable_cv_ids — this is fine                        │
+│                                                                                                                │
+│ 16 Rules + 16 LFs                                                                                              │
+│                                                                                                                │
+│ STATIC (6): static_fifteen_hour_avg, static_50_connections_1_ap, static_short_irregular_sessions,              │
+│ static_late_night, static_single_room_type (JOINs space+space_metadata), static_off_hour                       │
+│                                                                                                                │
+│ LAPTOP (5): laptop_copair (self-join, binary presence LF), laptop_daily_avg, laptop_valid_room_type (JOINs     │
+│ space+space_metadata), laptop_unique_room, laptop_total_connected_duration                                     │
+│                                                                                                                │
+│ PHONE (5): phone_copair (self-join, binary presence LF), phone_1_hour_average, phone_6_different_room_type,    │
+│ phone_3_days_6_room_type, phone_weekday                                                                        │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ File 2: user_queries_pg.md                                                                                     │
+│                                                                                                                │
+│ CV Tree                                                                                                        │
+│                                                                                                                │
+│ user_type                                                                                                      │
+│   ├── VISITOR                                                                                                  │
+│   ├── FACULTY                                                                                                  │
+│   ├── STAFF                                                                                                    │
+│   ├── UNDERGRAD                                                                                                │
+│   └── GRAD                                                                                                     │
+│                                                                                                                │
+│ Pipeline Design                                                                                                │
+│                                                                                                                │
+│ - Single Snorkel run, cardinality=5                                                                            │
+│ - 23 rules + 23 LFs                                                                                            │
+│                                                                                                                │
+│ Known Discrepancies to Flag                                                                                    │
+│                                                                                                                │
+│ 1. phone_6_different_room_type_query: Comment says "6+ room types" but SQL body is identical to                │
+│ phone_1_hour_average_query (checks avg session <= 1hr). Translate as-is, flag in doc.                          │
+│ 2. staff_office_query: SQL body is copy of faculty_unique_rooms_query (checks faculty offices). Comment says   │
+│ "staff-designated office". Translate as-is, flag in doc.                                                       │
+│ 3. Queries with columns: [] (undergrad_end_time_10_days, undergrad_room_occupancy, undergrad_split_work_days): │
+│  Must modify rule to return the qualifying metric so LF has something to check.                                │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ File 3: group_queries_pg.md                                                                                    │
+│                                                                                                                │
+│ Special: Open-Ended Groups                                                                                     │
+│                                                                                                                │
+│ - All 3 queries have label: NULL — they discover space_name affiliations, not fixed CVs                        │
+│ - Rules return the dominant group per entity                                                                   │
+│ - No Snorkel run — these function as feature extraction                                                        │
+│ - Document as rules-only pipeline; the output space_name IS the classification                                 │
+│ - If Snorkel is desired later, discovered groups must first be registered as CVs                               │
+│                                                                                                                │
+│ 3 Rules                                                                                                        │
+│                                                                                                                │
+│ - group_unique_room_single_room (JOINs region_to_coverage, remove LIMIT 10)                                    │
+│ - group_80_percent_weekday (observation_merged→user_ap_trajectory mapping)                                     │
+│ - group_copair (self-join with region_to_coverage)                                                             │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ Implementation Order                                                                                           │
+│                                                                                                                │
+│ 1. device_queries_pg.md — best understood, matches pipeline_inputs.md pattern                                  │
+│ 2. user_queries_pg.md — largest (23 queries), same pattern                                                     │
+│ 3. group_queries_pg.md — smallest (3 queries), different architecture (no Snorkel)                             │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ Verification                                                                                                   │
+│                                                                                                                │
+│ 1. Review each translated SQL for PG syntax correctness (no MySQL-isms remaining)                              │
+│ 2. Confirm all DAYOFWEEK shifts match intent (weekday = Mon-Fri)                                               │
+│ 3. Confirm all HAVING alias patterns are wrapped in subqueries                                                 │
+│ 4. Confirm rules return metrics without final WHERE filters                                                    │
+│ 5. Confirm LFs implement the correct threshold logic from original WHERE                                       │
+│ 6. Confirm "people" pass-through is documented with label_filter=null                                          │
+│                                                                                                                │
+│ ---                                                                                                            │
+│ Source Files                                                                                                   │
+│                                                                                                                │
+│ ┌───────────────────────────────────┬─────────────────────────────────────────────────────────────────┐        │
+│ │               File                │                             Purpose                             │        │
+│ ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────┤        │
+│ │ device_queries.yaml               │ 16 MySQL device queries                                         │        │
+│ ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────┤        │
+│ │ user_queries.yaml                 │ 23 MySQL user queries                                           │        │
+│ ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────┤        │
+│ │ group_queries.yaml                │ 3 MySQL group queries                                           │        │
+│ ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────┤        │
+│ │ pipeline_inputs.md                │ Template format to follow                                       │        │
+│ ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────┤        │
+│ │ backend/utils/resolve_entities.py │ Pass-through behavior (lines 137-140)                           │        │
+│ ├───────────────────────────────────┼─────────────────────────────────────────────────────────────────┤        │
+│ │ backend/dagster_app/assets.py     │ Snorkel cardinality from LF applicable_cv_ids (lines 1435-1444) │        │
+│ └───────────────────────────────────┴─────────────────────────────────────────────────────────────────┘ 

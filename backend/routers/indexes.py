@@ -1,14 +1,17 @@
 """Index CRUD and materialization endpoints."""
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List
 from backend.db.session import get_db
-from backend.db.models import ConceptIndex, DatabaseConnection
+from backend.db.models import ConceptIndex, ConceptValue, DatabaseConnection, SnorkelJob
 from backend.schemas import (
     IndexCreate,
     IndexUpdate,
     IndexResponse,
-    IndexMaterializeResponse
+    IndexMaterializeResponse,
+    DerivedIndexCreate,
+    LabelFilterUpdate,
+    EntityPreviewResponse,
 )
 
 router = APIRouter()
@@ -21,7 +24,7 @@ async def create_index(
     db: Session = Depends(get_db)
 ):
     """
-    Create a new index definition.
+    Create a new SQL index definition.
 
     - **c_id**: Concept ID
     - **name**: Index name (must be unique within concept)
@@ -31,6 +34,18 @@ async def create_index(
     - **partition_type**: Optional partitioning (time, id_range, categorical)
     - **partition_config**: Partition configuration
     """
+    # SQL indexes require conn_id and sql_query
+    if not request.conn_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="conn_id is required for SQL indexes"
+        )
+    if not request.sql_query:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sql_query is required for SQL indexes"
+        )
+
     # Validate SQL syntax (basic validation)
     query_upper = request.sql_query.strip().upper()
     if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH")):
@@ -62,15 +77,35 @@ async def create_index(
             detail=f"Database connection with ID {request.conn_id} not found"
         )
 
+    # Validate cv_id if provided: must belong to this concept and be a root CV
+    if request.cv_id is not None:
+        cv = db.query(ConceptValue).filter(
+            ConceptValue.cv_id == request.cv_id,
+            ConceptValue.c_id == c_id
+        ).first()
+        if not cv:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Concept value {request.cv_id} not found in concept {c_id}"
+            )
+        if cv.parent_cv_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="SQL indexes can only be assigned to root concept values (parent_cv_id must be null)"
+            )
+
     # Create index
     index = ConceptIndex(
         c_id=c_id,
         name=request.name,
         conn_id=request.conn_id,
+        key_column=request.key_column,
         sql_query=request.sql_query,
         query_template_params=request.query_template_params,
         partition_type=request.partition_type,
         partition_config=request.partition_config,
+        source_type='sql',
+        cv_id=request.cv_id,
         is_materialized=False
     )
 
@@ -191,12 +226,24 @@ async def update_index(
                 detail=f"Database connection with ID {update_data['conn_id']} not found"
             )
 
+    # Verify parent snorkel job exists if updating
+    if "parent_snorkel_job_id" in update_data and update_data["parent_snorkel_job_id"] is not None:
+        parent_job = db.query(SnorkelJob).filter(
+            SnorkelJob.job_id == update_data["parent_snorkel_job_id"],
+            SnorkelJob.c_id == c_id
+        ).first()
+        if not parent_job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Snorkel job {update_data['parent_snorkel_job_id']} not found for concept {c_id}"
+            )
+
     # Update fields
     for key, value in update_data.items():
         setattr(index, key, value)
 
-    # Reset materialization status if query changed
-    if "sql_query" in update_data or "query_template_params" in update_data:
+    # Reset materialization status if query or key_column changed
+    if "sql_query" in update_data or "query_template_params" in update_data or "key_column" in update_data:
         index.is_materialized = False
         index.materialized_at = None
         index.row_count = None
@@ -324,3 +371,261 @@ async def materialize_index(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to trigger Dagster job: {str(e)}"
         )
+
+
+# ============================================================================
+# Derived Index Endpoints
+# ============================================================================
+
+def _trace_conn_id(index_id: int, db: Session, visited: set = None) -> int:
+    """Walk the parent chain up to the root SQL index and return its conn_id."""
+    if visited is None:
+        visited = set()
+    if index_id in visited:
+        raise ValueError(f"Circular reference detected at index {index_id}")
+    visited.add(index_id)
+
+    idx = db.query(ConceptIndex).filter(ConceptIndex.index_id == index_id).first()
+    if not idx:
+        raise ValueError(f"Index {index_id} not found")
+    if idx.source_type == "sql":
+        return idx.conn_id
+    if idx.parent_index_id:
+        return _trace_conn_id(idx.parent_index_id, db, visited)
+    if idx.parent_snorkel_job_id:
+        job = db.query(SnorkelJob).filter(SnorkelJob.job_id == idx.parent_snorkel_job_id).first()
+        if not job:
+            raise ValueError(f"Snorkel job {idx.parent_snorkel_job_id} not found")
+        parent_idx = db.query(ConceptIndex).filter(ConceptIndex.index_id == job.index_id).first()
+        if not parent_idx:
+            raise ValueError(f"Parent index {job.index_id} not found")
+        return _trace_conn_id(parent_idx.index_id, db, visited)
+    raise ValueError(f"Cannot trace conn_id for index {index_id}")
+
+
+@router.post("/{c_id}/indexes/derived", response_model=IndexResponse, status_code=status.HTTP_201_CREATED)
+async def create_derived_index(
+    c_id: int,
+    request: DerivedIndexCreate,
+    db: Session = Depends(get_db)
+):
+    """
+    Create a derived index (pipeline input for a CV node).
+
+    - Root derived: set `parent_index_id` (points to a SQL index), no label_filter.
+    - Child derived: set `parent_snorkel_job_id` (completed Snorkel job) + optional `label_filter`.
+
+    The system inherits conn_id by tracing up to the root SQL index and computes
+    filtered_count via entity resolution.
+    """
+    # Validate cv_id belongs to this concept
+    cv = db.query(ConceptValue).filter(
+        ConceptValue.cv_id == request.cv_id,
+        ConceptValue.c_id == c_id
+    ).first()
+    if not cv:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Concept value {request.cv_id} not found in concept {c_id}"
+        )
+
+    # Must have exactly one parent reference
+    if request.parent_index_id and request.parent_snorkel_job_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Set either parent_index_id or parent_snorkel_job_id, not both"
+        )
+    if not request.parent_index_id and not request.parent_snorkel_job_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Must set either parent_index_id or parent_snorkel_job_id"
+        )
+
+    # Validate parent exists
+    if request.parent_index_id:
+        parent_idx = db.query(ConceptIndex).filter(
+            ConceptIndex.index_id == request.parent_index_id
+        ).first()
+        if not parent_idx:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Parent index {request.parent_index_id} not found"
+            )
+
+    if request.parent_snorkel_job_id:
+        parent_job = db.query(SnorkelJob).filter(
+            SnorkelJob.job_id == request.parent_snorkel_job_id,
+            SnorkelJob.status == "COMPLETED"
+        ).first()
+        if not parent_job:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Completed Snorkel job {request.parent_snorkel_job_id} not found"
+            )
+
+    # Check name uniqueness
+    existing = db.query(ConceptIndex).filter(
+        ConceptIndex.c_id == c_id,
+        ConceptIndex.name == request.name
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Index with name '{request.name}' already exists for concept {c_id}"
+        )
+
+    # Inherit conn_id from root SQL index
+    try:
+        parent_id = request.parent_index_id
+        if not parent_id and request.parent_snorkel_job_id:
+            parent_job = db.query(SnorkelJob).filter(
+                SnorkelJob.job_id == request.parent_snorkel_job_id
+            ).first()
+            parent_id = parent_job.index_id
+        inherited_conn_id = _trace_conn_id(parent_id, db)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot trace connection: {str(e)}"
+        )
+
+    # Compute filtered_count via entity resolution
+    filtered_count = None
+    try:
+        from backend.utils.resolve_entities import resolve_entity_ids as _resolve
+        # Create a temporary index-like object to resolve
+        # We need the index to exist first, so we'll compute after creation
+    except ImportError:
+        pass
+
+    index = ConceptIndex(
+        c_id=c_id,
+        name=request.name,
+        source_type="derived",
+        cv_id=request.cv_id,
+        conn_id=inherited_conn_id,
+        parent_index_id=request.parent_index_id,
+        parent_snorkel_job_id=request.parent_snorkel_job_id,
+        label_filter=request.label_filter,
+        output_type=request.output_type,
+        sql_query=None,
+        is_materialized=True,  # Derived indexes are "materialized" by definition (virtual)
+    )
+
+    db.add(index)
+    db.commit()
+    db.refresh(index)
+
+    # Compute filtered_count now that the index exists
+    try:
+        from backend.utils.resolve_entities import resolve_entity_ids as _resolve
+        df = _resolve(index.index_id, db)
+        index.filtered_count = len(df)
+        index.row_count = len(df)
+        db.commit()
+        db.refresh(index)
+    except Exception as e:
+        # Non-critical — count can be computed later
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to compute filtered_count: {e}")
+
+    return index
+
+
+@router.patch("/{c_id}/indexes/{index_id}/filter", response_model=IndexResponse)
+async def update_label_filter(
+    c_id: int,
+    index_id: int,
+    request: LabelFilterUpdate,
+    db: Session = Depends(get_db)
+):
+    """
+    Update the label filter on a derived index.
+
+    Only valid for derived indexes with a parent_snorkel_job_id.
+    Recomputes filtered_count after updating.
+    """
+    index = db.query(ConceptIndex).filter(
+        ConceptIndex.c_id == c_id,
+        ConceptIndex.index_id == index_id
+    ).first()
+
+    if not index:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Index with ID {index_id} not found for concept {c_id}"
+        )
+
+    if index.source_type != "derived":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Label filter can only be set on derived indexes"
+        )
+
+    if not index.parent_snorkel_job_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Label filter requires a parent_snorkel_job_id"
+        )
+
+    index.label_filter = request.label_filter
+
+    # Recompute filtered_count
+    try:
+        from backend.utils.resolve_entities import resolve_entity_ids as _resolve
+        df = _resolve(index.index_id, db)
+        index.filtered_count = len(df)
+        index.row_count = len(df)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to recompute filtered_count: {e}")
+
+    db.commit()
+    db.refresh(index)
+
+    return index
+
+
+@router.get("/{c_id}/indexes/{index_id}/entities", response_model=EntityPreviewResponse)
+async def get_index_entities(
+    c_id: int,
+    index_id: int,
+    limit: int = Query(default=100, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db)
+):
+    """
+    Preview entities from any index type (SQL or derived).
+
+    Uses resolve_entity_ids() to get the full entity set, then paginates.
+    """
+    index = db.query(ConceptIndex).filter(
+        ConceptIndex.c_id == c_id,
+        ConceptIndex.index_id == index_id
+    ).first()
+
+    if not index:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Index with ID {index_id} not found for concept {c_id}"
+        )
+
+    try:
+        from backend.utils.resolve_entities import resolve_entity_ids as _resolve
+        df = _resolve(index.index_id, db)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resolve entities: {str(e)}"
+        )
+
+    total_count = len(df)
+    page = df.iloc[offset:offset + limit]
+    entities = page.to_dict(orient="records")
+
+    return EntityPreviewResponse(
+        index_id=index_id,
+        source_type=index.source_type,
+        total_count=total_count,
+        entities=entities,
+    )

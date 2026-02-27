@@ -13,7 +13,7 @@ export async function getLF(cId: number, lfId: number): Promise<LabelingFunction
 
 export async function createLF(cId: number, body: {
   name: string;
-  rule_id: number;
+  rule_id?: number;
   applicable_cv_ids: number[];
   code?: string;
   allowed_imports?: string[];
@@ -24,6 +24,7 @@ export async function createLF(cId: number, body: {
 
 export async function updateLF(cId: number, lfId: number, body: Partial<{
   name: string;
+  rule_id: number;
   is_active: boolean;
   lf_config: Record<string, unknown>;
   applicable_cv_ids: number[];

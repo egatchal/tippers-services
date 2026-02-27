@@ -26,6 +26,7 @@ class ConceptValue(Base):
     description = Column(Text, nullable=True)
     display_order = Column(Integer, nullable=True)
     level = Column(Integer, default=1, nullable=False, server_default='1')
+    parent_cv_id = Column(Integer, ForeignKey('concept_values.cv_id'), nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
 
@@ -40,7 +41,7 @@ class DatabaseConnection(Base):
     port = Column(Integer, nullable=False)
     database = Column(String(255), nullable=False)
     user = Column(String(255), nullable=False)
-    encrypted_password = Column(Text, nullable=False)
+    encrypted_password = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
 
@@ -52,7 +53,8 @@ class ConceptIndex(Base):
     c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
     conn_id = Column(Integer, ForeignKey('database_connections.conn_id'), nullable=True)
     name = Column(String(255), nullable=False)
-    sql_query = Column(Text, nullable=False)
+    sql_query = Column(Text, nullable=True)  # NULL for derived indexes
+    key_column = Column(String(255), nullable=True)  # Column to extract unique keys from (e.g., 'user')
     query_template_params = Column(JSON, nullable=True)
     partition_type = Column(String(50), nullable=True)
     partition_config = Column(JSON, nullable=True)
@@ -61,6 +63,16 @@ class ConceptIndex(Base):
     materialized_at = Column(TIMESTAMP, nullable=True)
     row_count = Column(Integer, nullable=True)
     column_stats = Column(JSON, nullable=True)
+
+    # Hierarchical pipeline fields
+    source_type = Column(String(20), nullable=False, server_default='sql')  # 'sql' or 'derived'
+    cv_id = Column(Integer, ForeignKey('concept_values.cv_id'), nullable=True)
+    parent_index_id = Column(Integer, ForeignKey('concept_indexes.index_id'), nullable=True)
+    parent_snorkel_job_id = Column(Integer, ForeignKey('snorkel_jobs.job_id', use_alter=True, name='fk_ci_parent_snorkel_job'), nullable=True)
+    label_filter = Column(JSONB, nullable=True)  # e.g. {"labels": {"5": {"min_confidence": 0.8}}}
+    filtered_count = Column(Integer, nullable=True)
+    output_type = Column(String(50), nullable=True)  # 'softmax' or 'hard_labels' — for derived indexes
+
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
@@ -97,7 +109,7 @@ class LabelingFunction(Base):
     # Core references
     c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
     applicable_cv_ids = Column(ARRAY(Integer), nullable=False)
-    rule_id = Column(Integer, ForeignKey('concept_rules.r_id'), nullable=False)
+    rule_id = Column(Integer, ForeignKey('concept_rules.r_id'), nullable=True)
 
     name = Column(String(255), nullable=False)
 
@@ -136,7 +148,7 @@ class SnorkelJob(Base):
 
     job_id = Column(Integer, primary_key=True, autoincrement=True)
     c_id = Column(Integer, ForeignKey('concepts.c_id'), nullable=False)
-    index_id = Column(Integer, ForeignKey('concept_indexes.index_id'), nullable=False)
+    index_id = Column(Integer, ForeignKey('concept_indexes.index_id'), nullable=True)
 
     # References to rules (for feature computation) and LFs (for voting)
     rule_ids = Column(ARRAY(Integer), nullable=True)
@@ -151,6 +163,13 @@ class SnorkelJob(Base):
     result_path = Column(String(500), nullable=True)
     error_message = Column(Text, nullable=True)
     unified_job_id = Column(Integer, ForeignKey('jobs.job_id'), nullable=True)
+
+    # JSONB metadata (populated on completion — avoids S3 roundtrip for results endpoint)
+    lf_summary = Column(JSONB, nullable=True)
+    class_distribution = Column(JSONB, nullable=True)
+    overall_stats = Column(JSONB, nullable=True)
+    cv_id_to_index = Column(JSONB, nullable=True)
+    cv_id_to_name = Column(JSONB, nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     completed_at = Column(TIMESTAMP, nullable=True)

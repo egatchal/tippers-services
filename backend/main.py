@@ -18,6 +18,7 @@ from backend.routers import (
     jobs,
     serving,
     workflows,
+    pipeline,
 )
 import logging
 
@@ -69,6 +70,7 @@ app.include_router(datasets.router, prefix="/datasets", tags=["datasets"])
 app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(serving.router, prefix="/serving", tags=["serving"])
 app.include_router(workflows.router, prefix="/workflows", tags=["workflows"])
+app.include_router(pipeline.router, prefix="/concepts", tags=["pipeline"])
 
 @app.get("/")
 async def root():

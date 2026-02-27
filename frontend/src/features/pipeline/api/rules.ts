@@ -15,7 +15,6 @@ export async function createRule(cId: number, body: {
   name: string;
   index_id: number;
   sql_query: string;
-  index_column?: string;
   query_template_params?: Record<string, unknown>;
 }): Promise<Rule> {
   const { data } = await client.post(`/concepts/${cId}/rules`, body);
@@ -26,7 +25,6 @@ export async function updateRule(cId: number, rId: number, body: Partial<{
   name: string;
   index_id: number;
   sql_query: string;
-  index_column: string;
   query_template_params: Record<string, unknown>;
 }>): Promise<Rule> {
   const { data } = await client.patch(`/concepts/${cId}/rules/${rId}`, body);

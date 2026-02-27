@@ -11,30 +11,35 @@ import ConfirmDialog from '../../../../shared/components/ConfirmDialog';
 
 export default function ConceptValuePanel({ entity }: { entity: ConceptValue }) {
   const cId = useConceptStore((s) => s.activeConcept?.c_id);
+  const conceptValues = useConceptStore((s) => s.conceptValues);
   const queryClient = useQueryClient();
   const nodes = usePipelineStore((s) => s.nodes);
   const closePanel = usePipelineStore((s) => s.closePanel);
   const [showDelete, setShowDelete] = useState(false);
 
+  const childCount = conceptValues.filter((cv) => cv.parent_cv_id === entity.cv_id).length;
+  const parentCV = conceptValues.find((cv) => cv.cv_id === entity.parent_cv_id);
+
   const { register, handleSubmit } = useForm({
     defaultValues: {
       name: entity.name,
       description: entity.description ?? '',
-      level: entity.level,
       display_order: entity.display_order ?? '',
     },
   });
 
   const saveMutation = useMutation({
-    mutationFn: (values: { name: string; description: string; level: number; display_order: number | string }) =>
+    mutationFn: (values: { name: string; description: string; display_order: number | string }) =>
       updateConceptValue(cId!, entity.cv_id, {
         name: values.name,
         description: values.description || undefined,
-        level: Number(values.level),
+        level: entity.level,
         display_order: values.display_order !== '' ? Number(values.display_order) : undefined,
+        parent_cv_id: entity.parent_cv_id ?? undefined,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['conceptValues', cId] });
+      queryClient.invalidateQueries({ queryKey: ['cvTree', cId] });
       toast.success('Concept value updated');
     },
     onError: () => toast.error('Failed to update concept value'),
@@ -44,6 +49,7 @@ export default function ConceptValuePanel({ entity }: { entity: ConceptValue }) 
     mutationFn: () => deleteConceptValue(cId!, entity.cv_id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['conceptValues', cId] });
+      queryClient.invalidateQueries({ queryKey: ['cvTree', cId] });
       toast.success('Concept value deleted');
       closePanel();
     },
@@ -67,14 +73,35 @@ export default function ConceptValuePanel({ entity }: { entity: ConceptValue }) 
           <label className="block text-xs font-medium text-gray-700 mb-1">Description</label>
           <input {...register('description')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Optional" />
         </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-700 mb-1">Level</label>
-          <input type="number" {...register('level', { valueAsNumber: true })} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" />
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">ID</label>
+            <input value={entity.cv_id} readOnly className="w-full px-3 py-2 text-sm border border-gray-200 rounded-md bg-gray-50 text-gray-500 cursor-not-allowed font-mono" />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Level</label>
+            <input value={entity.level} readOnly className="w-full px-3 py-2 text-sm border border-gray-200 rounded-md bg-gray-50 text-gray-500 cursor-not-allowed" />
+          </div>
         </div>
+
+        <div>
+          <label className="block text-xs font-medium text-gray-700 mb-1">Parent</label>
+          <input
+            value={parentCV ? `${parentCV.name} (#${parentCV.cv_id})` : 'None (root)'}
+            readOnly
+            className="w-full px-3 py-2 text-sm border border-gray-200 rounded-md bg-gray-50 text-gray-500 cursor-not-allowed"
+          />
+        </div>
+
         <div>
           <label className="block text-xs font-medium text-gray-700 mb-1">Display Order</label>
           <input type="number" {...register('display_order')} className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Optional" />
         </div>
+
+        {childCount > 0 && (
+          <p className="text-xs text-gray-500">{childCount} child concept value{childCount > 1 ? 's' : ''}</p>
+        )}
 
         <div className="flex gap-2 pt-2">
           <button type="submit" disabled={saveMutation.isPending} className="px-4 py-2 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50">Save</button>

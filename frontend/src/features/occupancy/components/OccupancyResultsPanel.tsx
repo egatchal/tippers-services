@@ -117,7 +117,7 @@ export default function OccupancyResultsPanel({ dataset, spaceId }: Props) {
                     ? new Date(entry.rawTime).toLocaleString()
                     : '';
                 }}
-                formatter={(value: number) => [value, 'Connections']}
+                formatter={(value) => [value ?? 0, 'Connections']}
                 contentStyle={{ fontSize: 12 }}
               />
               <Area

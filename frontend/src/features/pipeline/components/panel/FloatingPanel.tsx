@@ -4,11 +4,10 @@ import type { PipelineNodeData } from '../../types/nodes';
 import PanelHeader from './PanelHeader';
 import IndexPanel from './IndexPanel';
 import RulePanel from './RulePanel';
-import FeaturePanel from './FeaturePanel';
 import LabelingFunctionPanel from './LabelingFunctionPanel';
 import SnorkelRunPanel from './SnorkelRunPanel';
-import ClassifierRunPanel from './ClassifierRunPanel';
 import ConceptValuePanel from './ConceptValuePanel';
+import CVTreePanel from './CVTreePanel';
 
 export default function FloatingPanel() {
   const store = usePipelineStore();
@@ -61,10 +60,10 @@ function PanelContent({ entity }: { entity: PipelineNodeData }) {
   switch (entity.entityType) {
     case 'index': return <IndexPanel entity={entity.entity} />;
     case 'rule': return <RulePanel entity={entity.entity} />;
-    case 'feature': return <FeaturePanel entity={entity.entity} />;
     case 'lf': return <LabelingFunctionPanel entity={entity.entity} />;
     case 'snorkel': return <SnorkelRunPanel entity={entity.entity} />;
-    case 'classifier': return <ClassifierRunPanel entity={entity.entity} />;
     case 'cv': return <ConceptValuePanel entity={entity.entity} />;
+    case 'cvTree': return <CVTreePanel entity={entity} />;
+    case 'placeholder': return null;
   }
 }

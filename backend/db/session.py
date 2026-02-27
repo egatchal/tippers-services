@@ -598,6 +598,115 @@ def _run_migrations(engine):
           AND d.source_ref @> jsonb_build_object('entity_type', 'occupancy_space_chunk', 'space_id', c.space_id, 'interval_seconds', c.interval_seconds)
           AND d.storage_path = c.storage_path
         """,
+        # ---------------------------------------------------------------
+        # Hierarchical Snorkel Pipeline Migrations
+        # ---------------------------------------------------------------
+        # Add parent_cv_id to concept_values for CV tree hierarchy
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_values' AND column_name='parent_cv_id')
+            THEN ALTER TABLE concept_values ADD COLUMN parent_cv_id INTEGER REFERENCES concept_values(cv_id);
+            END IF;
+        END $$;
+        """,
+        # Add source_type to concept_indexes
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='source_type')
+            THEN ALTER TABLE concept_indexes ADD COLUMN source_type VARCHAR(20) NOT NULL DEFAULT 'sql';
+            END IF;
+        END $$;
+        """,
+        # Add cv_id to concept_indexes
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='cv_id')
+            THEN ALTER TABLE concept_indexes ADD COLUMN cv_id INTEGER REFERENCES concept_values(cv_id);
+            END IF;
+        END $$;
+        """,
+        # Add parent_index_id to concept_indexes
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='parent_index_id')
+            THEN ALTER TABLE concept_indexes ADD COLUMN parent_index_id INTEGER REFERENCES concept_indexes(index_id);
+            END IF;
+        END $$;
+        """,
+        # Add parent_snorkel_job_id, label_filter, filtered_count to concept_indexes
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='parent_snorkel_job_id')
+            THEN
+                ALTER TABLE concept_indexes ADD COLUMN parent_snorkel_job_id INTEGER REFERENCES snorkel_jobs(job_id);
+                ALTER TABLE concept_indexes ADD COLUMN label_filter JSONB;
+                ALTER TABLE concept_indexes ADD COLUMN filtered_count INTEGER;
+            END IF;
+        END $$;
+        """,
+        # Make sql_query nullable on concept_indexes (derived indexes have no SQL)
+        """
+        DO $$ BEGIN
+            IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='sql_query' AND is_nullable='NO')
+            THEN ALTER TABLE concept_indexes ALTER COLUMN sql_query DROP NOT NULL;
+            END IF;
+        END $$;
+        """,
+        # Add JSONB metadata columns to snorkel_jobs
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='snorkel_jobs' AND column_name='lf_summary')
+            THEN
+                ALTER TABLE snorkel_jobs ADD COLUMN lf_summary JSONB;
+                ALTER TABLE snorkel_jobs ADD COLUMN class_distribution JSONB;
+                ALTER TABLE snorkel_jobs ADD COLUMN overall_stats JSONB;
+                ALTER TABLE snorkel_jobs ADD COLUMN cv_id_to_index JSONB;
+                ALTER TABLE snorkel_jobs ADD COLUMN cv_id_to_name JSONB;
+            END IF;
+        END $$;
+        """,
+        # Make encrypted_password nullable on database_connections (password not always required)
+        """
+        DO $$ BEGIN
+            IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='database_connections' AND column_name='encrypted_password' AND is_nullable='NO')
+            THEN ALTER TABLE database_connections ALTER COLUMN encrypted_password DROP NOT NULL;
+            END IF;
+        END $$;
+        """,
+        # Add key_column to concept_indexes (identifies the unique entity column)
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='key_column')
+            THEN ALTER TABLE concept_indexes ADD COLUMN key_column VARCHAR(255);
+            END IF;
+        END $$;
+        """,
+        # Make rule_id nullable on labeling_functions (rule set via canvas edge)
+        """
+        ALTER TABLE labeling_functions ALTER COLUMN rule_id DROP NOT NULL;
+        """,
+        # Make index_id nullable on snorkel_jobs (index set via canvas edge for draft jobs)
+        """
+        ALTER TABLE snorkel_jobs ALTER COLUMN index_id DROP NOT NULL;
+        """,
+        # Add output_type to concept_indexes (for derived indexes: softmax or hard_labels)
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='concept_indexes' AND column_name='output_type')
+            THEN ALTER TABLE concept_indexes ADD COLUMN output_type VARCHAR(50);
+            END IF;
+        END $$;
+        """,
     ]
 
     for i, sql in enumerate(migrations):

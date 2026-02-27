@@ -10,7 +10,7 @@ const schema = z.object({
   port: z.coerce.number().int().positive(),
   database: z.string().min(1, 'Required'),
   user: z.string().min(1, 'Required'),
-  password: z.string().min(1, 'Required'),
+  password: z.string().optional().default(''),
 });
 
 type FormValues = z.output<typeof schema>;

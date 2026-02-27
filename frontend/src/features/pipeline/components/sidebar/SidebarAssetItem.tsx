@@ -1,4 +1,3 @@
-import { useDraggable } from '@dnd-kit/core';
 import { GripVertical } from 'lucide-react';
 import type { NodeStatus } from '../../../../shared/utils/statusColors';
 
@@ -19,19 +18,20 @@ interface Props {
 }
 
 export default function SidebarAssetItem({ nodeId, label, status, onClick }: Props) {
-  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: nodeId });
+  const handleDragStart = (e: React.DragEvent) => {
+    e.dataTransfer.setData('application/pipeline-node-id', nodeId);
+    e.dataTransfer.setData('application/pipeline-node-label', label);
+    e.dataTransfer.effectAllowed = 'move';
+  };
 
   return (
     <div
-      ref={setNodeRef}
+      draggable
+      onDragStart={handleDragStart}
       onClick={onClick}
-      className={`flex items-center gap-2 px-2 py-1.5 rounded text-sm cursor-pointer hover:bg-gray-100 transition-colors ${
-        isDragging ? 'opacity-50' : ''
-      }`}
+      className="flex items-center gap-2 px-2 py-1.5 rounded text-sm cursor-grab hover:bg-gray-100 transition-colors"
     >
-      <button {...listeners} {...attributes} className="cursor-grab p-0.5 text-gray-400 hover:text-gray-600" onClick={(e) => e.stopPropagation()}>
-        <GripVertical className="w-3 h-3" />
-      </button>
+      <GripVertical className="w-3 h-3 text-gray-400 shrink-0" />
       <span className={`w-2 h-2 rounded-full shrink-0 ${dotColors[status]}`} />
       <span className="truncate text-gray-700">{label}</span>
     </div>

@@ -1,21 +1,20 @@
 import type { PipelineEdge } from '../types/edges';
-import type { Index, Rule, Feature, LabelingFunction, SnorkelJob, ClassifierJob, ConceptValue } from '../types/entities';
+import type { Index, Rule, LabelingFunction, SnorkelJob, ConceptValue } from '../types/entities';
 
 export function buildEdges({
+  indexes,
   rules,
-  features,
   lfs,
   snorkelJobs,
-  classifierJobs,
   conceptValues,
+  selectedCV,
 }: {
   indexes?: Index[];
   rules: Rule[];
-  features: Feature[];
   lfs: LabelingFunction[];
   snorkelJobs: SnorkelJob[];
-  classifierJobs: ClassifierJob[];
   conceptValues: ConceptValue[];
+  selectedCV?: ConceptValue | null;
 }): PipelineEdge[] {
   const edges: PipelineEdge[] = [];
 
@@ -25,16 +24,6 @@ export function buildEdges({
       id: `e-index-${rule.index_id}-rule-${rule.r_id}`,
       source: `index-${rule.index_id}`,
       target: `rule-${rule.r_id}`,
-      type: 'pipelineEdge',
-    });
-  }
-
-  // Index → Feature (via feature.index_id)
-  for (const feat of features) {
-    edges.push({
-      id: `e-index-${feat.index_id}-feature-${feat.feature_id}`,
-      source: `index-${feat.index_id}`,
-      target: `feature-${feat.feature_id}`,
       type: 'pipelineEdge',
     });
   }
@@ -77,27 +66,45 @@ export function buildEdges({
     }
   }
 
-  // Feature → Classifier (via classifierJob.feature_ids)
-  for (const job of classifierJobs) {
-    for (const fId of job.feature_ids) {
-      edges.push({
-        id: `e-feature-${fId}-classifier-${job.job_id}`,
-        source: `feature-${fId}`,
-        target: `classifier-${job.job_id}`,
-        type: 'pipelineEdge',
-        data: { animated: job.status === 'RUNNING' || job.status === 'PENDING' },
-      });
+  // Derived index edges: Snorkel → Derived Index, SQL Index → Derived Index
+  if (indexes) {
+    for (const idx of indexes) {
+      if (idx.source_type !== 'derived') continue;
+      if (idx.parent_snorkel_job_id != null) {
+        edges.push({
+          id: `e-snorkel-${idx.parent_snorkel_job_id}-index-${idx.index_id}`,
+          source: `snorkel-${idx.parent_snorkel_job_id}`,
+          target: `index-${idx.index_id}`,
+          type: 'pipelineEdge',
+        });
+      }
+      if (idx.parent_index_id != null) {
+        edges.push({
+          id: `e-index-${idx.parent_index_id}-index-${idx.index_id}`,
+          source: `index-${idx.parent_index_id}`,
+          target: `index-${idx.index_id}`,
+          type: 'pipelineEdge',
+        });
+      }
     }
-
-    // Snorkel → Classifier (via classifierJob.snorkel_job_id)
-    edges.push({
-      id: `e-snorkel-${job.snorkel_job_id}-classifier-${job.job_id}`,
-      source: `snorkel-${job.snorkel_job_id}`,
-      target: `classifier-${job.job_id}`,
-      type: 'pipelineEdge',
-      data: { animated: job.status === 'RUNNING' || job.status === 'PENDING' },
-    });
   }
+
+  // Helper: create a non-interactive placeholder edge
+  const phEdge = (source: string, target: string): PipelineEdge => ({
+    id: `e-${source}-${target}`,
+    source,
+    target,
+    type: 'pipelineEdge',
+    selectable: false,
+    deletable: false,
+    data: { isPlaceholder: true },
+  });
+
+  // Placeholder edges — static reference chain, never connects to real nodes.
+  // Always shows full flow: Index → Rule → LF → Snorkel
+  edges.push(phEdge('placeholder-index', 'placeholder-rule'));
+  edges.push(phEdge('placeholder-rule', 'placeholder-lf'));
+  edges.push(phEdge('placeholder-lf', 'placeholder-snorkel'));
 
   return edges;
 }
